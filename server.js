@@ -1,11 +1,10 @@
 // ============================================================
-// HAIDOVILLE × SMOOBU SYNC — Render.com Server v2
+// HAIDOVILLE × SMOOBU SYNC - Render.com Server v3
 // ============================================================
-// v2 UPDATES:
-// - Added POST /bookings/create endpoint
-// - Added email notification (via Resend)
-// - Added optional Smoobu draft booking creation
-// - Keeps all existing sync functionality
+// v3 UPDATES:
+// - Forwards booking to GHL webhook (with exact payload format)
+// - Creates Smoobu draft booking (pending, unpaid) to auto-block dates
+// - Keeps all v2 functionality (email, sync, apartments-list)
 // ============================================================
 
 import express from 'express';
@@ -14,27 +13,21 @@ import { Resend } from 'resend';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---- Config from environment variables ----
+// ---- Config ----
 const SMOOBU_API_KEY = process.env.SMOOBU_API_KEY;
-const RESEND_API_KEY = process.env.RESEND_API_KEY;              // OPTIONAL
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || '';              // where to send notifs
-const FROM_EMAIL = process.env.FROM_EMAIL || 'onboarding@resend.dev'; // default to Resend's test domain
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || '';
+const FROM_EMAIL = process.env.FROM_EMAIL || 'onboarding@resend.dev';
+const GHL_WEBHOOK_URL = process.env.GHL_WEBHOOK_URL || '';
 const CACHE_DURATION_MS = 5 * 60 * 1000;
-const CREATE_SMOOBU_DRAFT = process.env.CREATE_SMOOBU_DRAFT === 'true'; // off by default
+const CREATE_SMOOBU_DRAFT = process.env.CREATE_SMOOBU_DRAFT === 'true';
 
 // ---- Apartment Mapping ----
 const APARTMENT_MAP = {
-  // ─── BARKADA ROOM ───
   3261782: 'barkada',
-
-  // ─── COUPLE ROOM ───
   3261742: 'couple',
-
-  // ─── FAMILY ROOMS ───
   3261662: { roomId: 'family', unit: 'Family Room 1' },
   3261737: { roomId: 'family', unit: 'Family Room 2' },
-
-  // ─── MIXED DORMITORY / BUNK BEDS ───
   3261752: { roomId: 'bunk', beds: 1 },
   3261757: { roomId: 'bunk', beds: 1 },
   3261762: { roomId: 'bunk', beds: 1 },
@@ -43,29 +36,27 @@ const APARTMENT_MAP = {
   3261777: { roomId: 'bunk', beds: 1 },
 };
 
-// Reverse map (roomName -> apartmentId) — gagamitin natin sa draft booking creation
+// For creating drafts: map room name to Smoobu apartment ID
 const ROOM_NAME_TO_APT_ID = {
   'Barkada Room': 3261782,
   'Couple Room': 3261742,
   'Family Room 1': 3261662,
   'Family Room 2': 3261737,
-  'Bunk Beds': [3261752, 3261757, 3261762, 3261767, 3261772, 3261777], // array kasi may 6
+  'Bunk Beds': [3261752, 3261757, 3261762, 3261767, 3261772, 3261777],
 };
 
-// ---- In-memory cache & pending bookings ----
+// ---- Cache ----
 let cache = { data: null, timestamp: 0 };
-const pendingBookings = []; // para sa soft-block
+const pendingBookings = [];
 
 // ---- Middleware ----
 app.use(express.json({ limit: '1mb' }));
 
-// ---- CORS ----
 app.use((req, res, next) => {
   const origin = req.headers.origin || '';
   const allowedOrigins = [
     'https://haidoville.com',
     'https://www.haidoville.com',
-    // Add your GoHighLevel funnel domain here
   ];
 
   if (allowedOrigins.includes(origin)) {
@@ -86,19 +77,25 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => {
   res.json({
     service: 'HaidoVille Smoobu Sync',
-    version: '2.0',
+    version: '3.0',
     status: 'online',
+    features: {
+      smoobuSync: !!SMOOBU_API_KEY,
+      email: !!RESEND_API_KEY && !!ADMIN_EMAIL,
+      ghlWebhook: !!GHL_WEBHOOK_URL,
+      smoobuDraft: CREATE_SMOOBU_DRAFT && !!SMOOBU_API_KEY
+    },
     endpoints: {
       bookings: 'GET /bookings',
       apartments: 'GET /apartments-list',
-      createBooking: 'POST /bookings/create',
+      createBooking: 'POST /bookings/create'
     },
     timestamp: new Date().toISOString(),
   });
 });
 
 // ============================================================
-// GET /apartments-list (existing)
+// GET /apartments-list
 // ============================================================
 app.get('/apartments-list', async (req, res) => {
   if (!SMOOBU_API_KEY) return res.status(500).json({ error: 'SMOOBU_API_KEY not configured' });
@@ -113,9 +110,7 @@ app.get('/apartments-list', async (req, res) => {
     const data = await response.json();
     const apartments = data.apartments || [];
     const sampleMapping = {};
-    apartments.forEach(apt => {
-      sampleMapping[apt.id] = `'${apt.name}'`;
-    });
+    apartments.forEach(apt => { sampleMapping[apt.id] = `'${apt.name}'`; });
     res.json({
       instructions: 'Copy IDs at gamitin sa APARTMENT_MAP',
       totalApartments: apartments.length,
@@ -128,7 +123,7 @@ app.get('/apartments-list', async (req, res) => {
 });
 
 // ============================================================
-// GET /bookings (existing sync endpoint)
+// GET /bookings (calendar sync)
 // ============================================================
 app.get('/bookings', async (req, res) => {
   if (!SMOOBU_API_KEY) return res.status(500).json({ error: 'SMOOBU_API_KEY not configured' });
@@ -229,7 +224,7 @@ app.get('/bookings', async (req, res) => {
 });
 
 // ============================================================
-// POST /bookings/create (NEW — eto yung custom checkout)
+// POST /bookings/create (MAIN CHECKOUT ENDPOINT)
 // ============================================================
 app.post('/bookings/create', async (req, res) => {
   try {
@@ -239,7 +234,6 @@ app.post('/bookings/create', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // Log booking in-memory (ephemeral pero good for debugging)
     pendingBookings.push({
       ...data,
       receivedAt: new Date().toISOString(),
@@ -251,19 +245,28 @@ app.post('/bookings/create', async (req, res) => {
       pendingBookings.shift();
     }
 
-    // Console log for Render logs (visible sa dashboard)
     console.log('[Booking Received]', data.bookingId, '-', data.guest.name, '(', data.guest.email, ')');
 
-    // ─── Send email notification ───
+    // Forward to GHL webhook (non-blocking, runs in parallel)
+    if (GHL_WEBHOOK_URL) {
+      forwardToGHL(data).catch(err => {
+        console.error('[GHL Webhook Error]', err.message);
+      });
+    }
+
+    // Send admin email (non-blocking)
     if (RESEND_API_KEY && ADMIN_EMAIL) {
       sendBookingEmail(data).catch(err => {
         console.error('[Email Error]', err.message);
       });
     }
 
-    // ─── Optional: Create draft booking sa Smoobu ───
+    // Create Smoobu draft booking to block dates (non-blocking)
+    // Invalidate cache so next GET /bookings call returns fresh data
     if (CREATE_SMOOBU_DRAFT && SMOOBU_API_KEY) {
-      createSmoobuDraft(data).catch(err => {
+      createSmoobuDraft(data).then(() => {
+        cache = { data: null, timestamp: 0 };
+      }).catch(err => {
         console.error('[Smoobu Draft Error]', err.message);
       });
     }
@@ -271,7 +274,7 @@ app.post('/bookings/create', async (req, res) => {
     res.json({
       success: true,
       bookingId: data.bookingId,
-      message: 'Booking logged successfully. Please send receipt via Messenger.',
+      message: 'Booking logged. Please send receipt via Messenger.',
     });
 
   } catch (err) {
@@ -281,7 +284,193 @@ app.post('/bookings/create', async (req, res) => {
 });
 
 // ============================================================
-// HELPER: Send email notification via Resend
+// HELPER: Forward to GHL Webhook
+// ============================================================
+async function forwardToGHL(data) {
+  if (!GHL_WEBHOOK_URL) return;
+
+  const payload = buildGhlPayload(data);
+
+  const response = await fetch(GHL_WEBHOOK_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`GHL webhook failed (${response.status}): ${errText}`);
+  }
+
+  console.log('[GHL Webhook Sent]', data.bookingId);
+}
+
+function buildGhlPayload(data) {
+  // Split name into first/last
+  const nameParts = (data.guest.name || '').trim().split(/\s+/);
+  const firstName = nameParts[0] || '';
+  const lastName = nameParts.slice(1).join(' ') || '';
+
+  // Format payment method (matches GHL automation expected format)
+  const channelLabels = {
+    gcash: 'GCash/PayMaya',
+    maya: 'GCash/PayMaya',
+    metro: 'Metrobank',
+    land: 'Landbank'
+  };
+  const paymentMethod = channelLabels[data.payment.channel] || data.payment.channel;
+
+  // Get first/primary room for room_type field
+  const firstRoom = data.rooms[0] || {};
+
+  // Format dates ("Apr 20, 2026")
+  const fmtShortDate = (d) => {
+    if (!d) return '';
+    try {
+      return new Date(d + 'T00:00:00').toLocaleDateString('en-US', {
+        month: 'short', day: 'numeric', year: 'numeric'
+      });
+    } catch(e) { return d; }
+  };
+
+  // Format confirmation date ("April 16, 2026")
+  const confirmationDate = new Date(data.submittedAt || new Date()).toLocaleDateString('en-US', {
+    month: 'long', day: 'numeric', year: 'numeric', timeZone: 'Asia/Manila'
+  });
+
+  // Format times ("10:52 PM")
+  const fmtTime12 = (t) => {
+    if (!t) return '';
+    const parts = t.split(':');
+    let h = parseInt(parts[0]);
+    const m = parts[1];
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    h = h % 12 || 12;
+    return h + ':' + m + ' ' + ampm;
+  };
+
+  // Compute totals
+  const grandTotal = data.payment.grandTotal || 0;
+  const dpAmount = data.payment.type === 'full' ? grandTotal : Math.ceil(grandTotal * 0.5);
+  const balance = data.payment.type === 'full' ? 0 : grandTotal - dpAmount;
+
+  // Combine all rooms if multiple
+  let roomType = firstRoom.name || '';
+  if (data.rooms.length > 1) {
+    roomType = data.rooms.map(r => r.name).join(' + ');
+  }
+
+  // Total pax (sum all rooms)
+  const totalPax = data.rooms.reduce((sum, r) => sum + (parseInt(r.pax) || 0), 0);
+  const totalNights = firstRoom.nights || 0;
+
+  return {
+    email: data.guest.email || '',
+    phone: data.guest.phone || '',
+    first_name: firstName,
+    last_name: lastName,
+    name: data.guest.name || '',
+    booking_id: data.bookingId,
+    confirmation_date: confirmationDate,
+    guest_name: data.guest.name || '',
+    contact_number: data.guest.phone || '',
+    email_address: data.guest.email || '',
+    age: String(data.guest.age || ''),
+    nationality: data.guest.nationality || '',
+    complete_address: data.guest.address || '',
+    room_type: roomType,
+    check_in_date: fmtShortDate(firstRoom.checkIn),
+    check_out_date: fmtShortDate(firstRoom.checkOut),
+    arrival_time: fmtTime12(data.guest.arrivalTime),
+    departure_time: fmtTime12(data.guest.departureTime),
+    port_of_arrival: data.guest.port || '',
+    no_of_nights: String(totalNights),
+    no_of_guests: String(totalPax),
+    payment_method: paymentMethod,
+    payment_ref: data.payment.referenceNumber || '',
+    total_amount: String(grandTotal),
+    dp_amount: String(dpAmount),
+    balance: String(balance),
+    // Extras for multi-room bookings
+    all_rooms: data.rooms.map(r => ({
+      name: r.name,
+      check_in: fmtShortDate(r.checkIn),
+      check_out: fmtShortDate(r.checkOut),
+      nights: String(r.nights),
+      pax: String(r.pax),
+      subtotal: String(r.subtotal)
+    })),
+    room_count: String(data.rooms.length),
+    special_request: data.guest.specialRequest || '',
+    payment_type: data.payment.type === 'full' ? 'Full Payment' : 'Downpayment (50%)'
+  };
+}
+
+// ============================================================
+// HELPER: Create Smoobu Draft Booking (auto-block dates)
+// ============================================================
+async function createSmoobuDraft(data) {
+  if (!CREATE_SMOOBU_DRAFT || !SMOOBU_API_KEY) return;
+
+  for (const room of data.rooms) {
+    const apartmentId = resolveApartmentId(room.name);
+    if (!apartmentId) {
+      console.warn('[Smoobu Draft] Unknown room:', room.name);
+      continue;
+    }
+
+    // Split name
+    const nameParts = (data.guest.name || '').trim().split(/\s+/);
+    const firstName = nameParts[0] || 'Guest';
+    const lastName = nameParts.slice(1).join(' ') || '(Pending)';
+
+    const payload = {
+      arrivalDate: room.checkIn,
+      departureDate: room.checkOut,
+      apartmentId: apartmentId,
+      channelId: 70, // Direct booking
+      firstName: firstName,
+      lastName: lastName,
+      email: data.guest.email,
+      phone: data.guest.phone,
+      adults: parseInt(room.pax) || 1,
+      price: room.subtotal,
+      priceStatus: 0, // unpaid
+      notice: `[WEBSITE ${data.bookingId}] ${data.payment.type.toUpperCase()} | ${data.payment.channel.toUpperCase()} | Ref: ${data.payment.referenceNumber} | AWAITING RECEIPT VERIFICATION`,
+      language: 'en',
+    };
+
+    try {
+      const response = await fetch('https://login.smoobu.com/api/reservations', {
+        method: 'POST',
+        headers: {
+          'Api-Key': SMOOBU_API_KEY,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const result = await response.json();
+      if (response.ok) {
+        console.log('[Smoobu Draft Created]', data.bookingId, 'room:', room.name, 'smoobuId:', result.id);
+      } else {
+        console.warn('[Smoobu Draft Failed]', JSON.stringify(result));
+      }
+    } catch (err) {
+      console.error('[Smoobu Draft Network Error]', err.message);
+    }
+  }
+}
+
+function resolveApartmentId(roomName) {
+  const mapping = ROOM_NAME_TO_APT_ID[roomName];
+  if (!mapping) return null;
+  if (Array.isArray(mapping)) return mapping[0];
+  return mapping;
+}
+
+// ============================================================
+// HELPER: Send Email Notification
 // ============================================================
 async function sendBookingEmail(data) {
   if (!RESEND_API_KEY) return;
@@ -306,7 +495,6 @@ async function sendBookingEmail(data) {
         <h2 style="margin:0;font-size:22px;">🏠 New HaidoVille Booking</h2>
         <p style="margin:6px 0 0;opacity:0.9;">Reference: ${data.bookingId}</p>
       </div>
-
       <div style="background:#f9f9f9;padding:20px;border-radius:0 0 12px 12px;">
         <h3 style="margin-top:0;color:#C9A96E;">👤 Guest Details</h3>
         <p style="margin:4px 0;"><strong>Name:</strong> ${data.guest.name}</p>
@@ -330,17 +518,11 @@ async function sendBookingEmail(data) {
 
         <div style="background:#fff;border-left:4px solid #C9A96E;padding:12px;margin-top:20px;border-radius:4px;">
           <strong>⏰ ACTION NEEDED:</strong><br>
-          Wait for customer's receipt via Messenger (m.me/haidoville), then manually create booking in Smoobu if verified.
+          Wait for customer's receipt via Messenger (m.me/haidoville), then verify payment and update Smoobu booking status to paid.
         </div>
-
-        <p style="margin-top:20px;font-size:12px;color:#888;">
-          Submitted: ${new Date(data.submittedAt).toLocaleString('en-PH', { timeZone: 'Asia/Manila' })}
-        </p>
       </div>
     </div>
   `;
-
-  const text = `New HaidoVille Booking\n\nRef: ${data.bookingId}\nName: ${data.guest.name}\nEmail: ${data.guest.email}\nPhone: ${data.guest.phone}\n\nRooms:\n${data.rooms.map((r, i) => `${i + 1}. ${r.name} | ${r.checkIn} → ${r.checkOut} | ${r.pax} ${r.paxLabel} | ₱${r.subtotal.toLocaleString()}`).join('\n')}\n\nPayment:\n- ${payTypeNames[data.payment.type]} via ${channelNames[data.payment.channel]}\n- Amount: ₱${data.payment.amount.toLocaleString()}\n- Grand Total: ₱${data.payment.grandTotal.toLocaleString()}\n- Reference #: ${data.payment.referenceNumber}\n\nAction: Wait for customer's receipt via m.me/haidoville`;
 
   await resend.emails.send({
     from: `HaidoVille Booking <${FROM_EMAIL}>`,
@@ -348,80 +530,18 @@ async function sendBookingEmail(data) {
     replyTo: data.guest.email,
     subject: `🏠 New Booking: ${data.bookingId} — ${data.guest.name}`,
     html,
-    text,
   });
 
   console.log('[Email Sent]', ADMIN_EMAIL, '-', data.bookingId);
 }
 
 // ============================================================
-// HELPER: Create draft booking sa Smoobu (OPTIONAL)
-// ============================================================
-async function createSmoobuDraft(data) {
-  if (!CREATE_SMOOBU_DRAFT || !SMOOBU_API_KEY) return;
-
-  for (const room of data.rooms) {
-    const apartmentId = resolveApartmentId(room.name);
-    if (!apartmentId) {
-      console.warn('[Smoobu Draft] Unknown room:', room.name);
-      continue;
-    }
-
-    const payload = {
-      arrivalDate: room.checkIn,
-      departureDate: room.checkOut,
-      apartmentId: apartmentId,
-      channelId: 70,  // Direct booking
-      firstName: data.guest.name.split(' ')[0] || data.guest.name,
-      lastName: data.guest.name.split(' ').slice(1).join(' ') || '(none)',
-      email: data.guest.email,
-      phone: data.guest.phone,
-      adults: room.pax,
-      price: room.subtotal,
-      priceStatus: 0, // unpaid
-      notice: `[WEBSITE ${data.bookingId}] Ref: ${data.payment.referenceNumber} | ${data.payment.channel.toUpperCase()} | Awaiting receipt verification`,
-      language: 'en',
-    };
-
-    try {
-      const response = await fetch('https://login.smoobu.com/api/reservations', {
-        method: 'POST',
-        headers: {
-          'Api-Key': SMOOBU_API_KEY,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-      });
-
-      const result = await response.json();
-      if (response.ok) {
-        console.log('[Smoobu Draft Created]', data.bookingId, '→ Smoobu ID:', result.id);
-      } else {
-        console.warn('[Smoobu Draft Failed]', JSON.stringify(result));
-      }
-    } catch (err) {
-      console.error('[Smoobu Draft Network Error]', err.message);
-    }
-  }
-}
-
-function resolveApartmentId(roomName) {
-  const mapping = ROOM_NAME_TO_APT_ID[roomName];
-  if (!mapping) return null;
-  if (Array.isArray(mapping)) {
-    // Para sa Bunk Beds — pick first one as representative
-    return mapping[0];
-  }
-  return mapping;
-}
-
-// ============================================================
 // Start server
 // ============================================================
 app.listen(PORT, () => {
-  console.log(`🚀 HaidoVille Smoobu Sync v2 running on port ${PORT}`);
-  console.log(`   Smoobu API: ${SMOOBU_API_KEY ? '✅' : '❌ SMOOBU_API_KEY missing'}`);
-  console.log(`   Resend:     ${RESEND_API_KEY ? '✅' : '⚠️  RESEND_API_KEY not set (email disabled)'}`);
-  console.log(`   Admin email: ${ADMIN_EMAIL || '⚠️ not set'}`);
-  console.log(`   Smoobu Drafts: ${CREATE_SMOOBU_DRAFT ? '✅ ON' : '❌ OFF (manual mode)'}`);
+  console.log(`🚀 HaidoVille Smoobu Sync v3 running on port ${PORT}`);
+  console.log(`   Smoobu API:    ${SMOOBU_API_KEY ? '✅' : '❌'}`);
+  console.log(`   Email:         ${RESEND_API_KEY && ADMIN_EMAIL ? '✅' : '⚠️  disabled'}`);
+  console.log(`   GHL Webhook:   ${GHL_WEBHOOK_URL ? '✅' : '⚠️  not configured'}`);
+  console.log(`   Smoobu Drafts: ${CREATE_SMOOBU_DRAFT ? '✅ ON' : '❌ OFF'}`);
 });
