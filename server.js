@@ -1,48 +1,32 @@
-// ============================================================
-// HAIDOVILLE × SMOOBU SYNC — Render.com Server
-// ============================================================
-// Proxy server that fetches bookings from Smoobu and exposes
-// them as a simple API for the HaidoVille website to consume.
-//
-// Deploy to: Render.com (free tier)
-// ============================================================
 
 import express from 'express';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---- Config from environment variables (set in Render dashboard) ----
 const SMOOBU_API_KEY = process.env.SMOOBU_API_KEY;
 const CACHE_DURATION_MS = 5 * 60 * 1000; // 5 minutes
 
-// ---- Apartment Mapping ----
-// I-map mo yung Smoobu apartment IDs papunta sa HaidoVille room categories.
-// Para makita yung IDs mo, open sa browser: /apartments-list
-//
-// FORMAT:
-// - Simple room: 'room_id' (barkada, couple)
-// - Bunk bed:    { roomId: 'bunk', beds: N }
-// - Family room: { roomId: 'family', unit: 'Family Room 1' }
 
 const APARTMENT_MAP = {
-  // ⚠️ HALIMBAWA LANG — PALITAN MO NG ACTUAL IDs MO AFTER MAKITA SA /apartments-list
-  //
-  // Kung isang listing lang yung bunk sa Smoobu na may 6 beds:
-  // 123456: { roomId: 'bunk', beds: 6 },
-  //
-  // Kung 6 separate listings per bed:
-  // 123451: { roomId: 'bunk', beds: 1 },
-  // 123452: { roomId: 'bunk', beds: 1 },
-  // ...
-  //
-  // 123457: 'barkada',
-  // 123458: 'couple',
-  //
-  // 123459: { roomId: 'family', unit: 'Family Room 1' },
-  // 123460: { roomId: 'family', unit: 'Family Room 2' },
-};
+  // BUNK BEDS (6 separate listings, 1 bed each)
+  3261752: { roomId: 'bunk', beds: 1 }, // Bed1
+  3261757: { roomId: 'bunk', beds: 1 }, // Bed2
+  3261762: { roomId: 'bunk', beds: 1 }, // Bed3
+  3261767: { roomId: 'bunk', beds: 1 }, // Bed4
+  3261772: { roomId: 'bunk', beds: 1 }, // Bed5
+  3261777: { roomId: 'bunk', beds: 1 }, // Bed6
 
+  // BARKADA ROOM
+  3261782: 'barkada',
+
+  // COUPLE ROOM
+  3261742: 'couple',
+
+  // FAMILY ROOMS (2 units)
+  3261662: { roomId: 'family', unit: 'Family Room 1' },
+  3261737: { roomId: 'family', unit: 'Family Room 2' },
+};
 // ---- Simple in-memory cache ----
 let cache = {
   data: null,
@@ -53,18 +37,14 @@ let cache = {
 app.use((req, res, next) => {
   const origin = req.headers.origin || '';
 
-  // Allowed domains — palitan mo ng actual domains mo
   const allowedOrigins = [
     'https://haidoville.com',
     'https://www.haidoville.com',
-    // GoHighLevel funnel domain kung may separate ka
-    // 'https://your-funnel.gohighlevel.com',
   ];
 
   if (allowedOrigins.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   } else {
-    // Fallback: allow all. Kung gusto mo strict, comment out ito.
     res.setHeader('Access-Control-Allow-Origin', '*');
   }
 

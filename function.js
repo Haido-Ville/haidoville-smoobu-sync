@@ -18,7 +18,7 @@
 
 // ⚠️ PALITAN MO ITO NG ACTUAL RENDER URL MO AFTER DEPLOY
 // Example: 'https://haidoville-smoobu-sync.onrender.com/bookings'
-const SMOOBU_PROXY_URL = 'https://YOUR-APP-NAME.onrender.com/bookings';
+const SMOOBU_PROXY_URL = 'https://haidoville-smoobu-sync.onrender.com/bookings';
 
 async function hvLoadBooked() {
   // Reset arrays first
