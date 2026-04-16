@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: haidoville-smoobu-sync
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: SMOOBU_API_KEY
+        sync: false
+    healthCheckPath: /

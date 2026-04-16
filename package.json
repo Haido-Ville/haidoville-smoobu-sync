@@ -1,0 +1,16 @@
+{
+  "name": "haidoville-smoobu-sync",
+  "version": "1.0.0",
+  "description": "Smoobu API proxy for HaidoVille availability sync",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
