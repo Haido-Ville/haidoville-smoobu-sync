@@ -1,10 +1,15 @@
 // ============================================================
-// HAIDOVILLE × SMOOBU SYNC - Render.com Server v3
+// HAIDOVILLE × SMOOBU SYNC - Render.com Server v3.1
 // ============================================================
-// v3 UPDATES:
+// v3.1 UPDATES:
+// - Added `source` field to GHL payload (for OTA analytics tracking)
+// - Source defaults to "Website (Direct)" if not provided by client
+//
+// v3 FEATURES (unchanged):
 // - Forwards booking to GHL webhook (with exact payload format)
 // - Creates Smoobu draft booking (pending, unpaid) to auto-block dates
-// - Keeps all v2 functionality (email, sync, apartments-list)
+// - Email notification via Resend
+// - Calendar sync via /bookings
 // ============================================================
 
 import express from 'express';
@@ -77,7 +82,7 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => {
   res.json({
     service: 'HaidoVille Smoobu Sync',
-    version: '3.0',
+    version: '3.1',
     status: 'online',
     features: {
       smoobuSync: !!SMOOBU_API_KEY,
@@ -234,6 +239,12 @@ app.post('/bookings/create', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
+    // Default source to "Website (Direct)" if client didn't send one
+    // (backward compatibility with older website code versions)
+    if (!data.source) {
+      data.source = 'Website (Direct)';
+    }
+
     pendingBookings.push({
       ...data,
       receivedAt: new Date().toISOString(),
@@ -245,7 +256,7 @@ app.post('/bookings/create', async (req, res) => {
       pendingBookings.shift();
     }
 
-    console.log('[Booking Received]', data.bookingId, '-', data.guest.name, '(', data.guest.email, ')');
+    console.log('[Booking Received]', data.bookingId, '-', data.guest.name, '(', data.guest.email, ') source:', data.source);
 
     // Forward to GHL webhook (non-blocking, runs in parallel)
     if (GHL_WEBHOOK_URL) {
@@ -302,7 +313,7 @@ async function forwardToGHL(data) {
     throw new Error(`GHL webhook failed (${response.status}): ${errText}`);
   }
 
-  console.log('[GHL Webhook Sent]', data.bookingId);
+  console.log('[GHL Webhook Sent]', data.bookingId, 'source:', payload.source);
 }
 
 function buildGhlPayload(data) {
@@ -365,11 +376,17 @@ function buildGhlPayload(data) {
   const totalNights = firstRoom.nights || 0;
 
   return {
+    // === BOOKING SOURCE (analytics tracking) ===
+    source: data.source || 'Website (Direct)',
+
+    // === CONTACT DETAILS ===
     email: data.guest.email || '',
     phone: data.guest.phone || '',
     first_name: firstName,
     last_name: lastName,
     name: data.guest.name || '',
+
+    // === BOOKING DETAILS ===
     booking_id: data.bookingId,
     confirmation_date: confirmationDate,
     guest_name: data.guest.name || '',
@@ -386,12 +403,18 @@ function buildGhlPayload(data) {
     port_of_arrival: data.guest.port || '',
     no_of_nights: String(totalNights),
     no_of_guests: String(totalPax),
+
+    // === PAYMENT DETAILS ===
     payment_method: paymentMethod,
     payment_ref: data.payment.referenceNumber || '',
     total_amount: String(grandTotal),
     dp_amount: String(dpAmount),
     balance: String(balance),
-    // Extras for multi-room bookings
+    payment_type: data.payment.type === 'full' ? 'Full Payment' : 'Downpayment (50%)',
+    special_request: data.guest.specialRequest || '',
+
+    // === ROOMS ARRAY (for multi-room bookings) ===
+    room_count: String(data.rooms.length),
     all_rooms: data.rooms.map(r => ({
       name: r.name,
       check_in: fmtShortDate(r.checkIn),
@@ -399,10 +422,7 @@ function buildGhlPayload(data) {
       nights: String(r.nights),
       pax: String(r.pax),
       subtotal: String(r.subtotal)
-    })),
-    room_count: String(data.rooms.length),
-    special_request: data.guest.specialRequest || '',
-    payment_type: data.payment.type === 'full' ? 'Full Payment' : 'Downpayment (50%)'
+    }))
   };
 }
 
@@ -494,6 +514,7 @@ async function sendBookingEmail(data) {
       <div style="background:linear-gradient(135deg,#C9A96E 0%,#b8935a 100%);color:#fff;padding:20px;border-radius:12px 12px 0 0;">
         <h2 style="margin:0;font-size:22px;">🏠 New HaidoVille Booking</h2>
         <p style="margin:6px 0 0;opacity:0.9;">Reference: ${data.bookingId}</p>
+        <p style="margin:4px 0 0;opacity:0.8;font-size:13px;">Source: ${data.source || 'Website (Direct)'}</p>
       </div>
       <div style="background:#f9f9f9;padding:20px;border-radius:0 0 12px 12px;">
         <h3 style="margin-top:0;color:#C9A96E;">👤 Guest Details</h3>
@@ -539,7 +560,7 @@ async function sendBookingEmail(data) {
 // Start server
 // ============================================================
 app.listen(PORT, () => {
-  console.log(`🚀 HaidoVille Smoobu Sync v3 running on port ${PORT}`);
+  console.log(`🚀 HaidoVille Smoobu Sync v3.1 running on port ${PORT}`);
   console.log(`   Smoobu API:    ${SMOOBU_API_KEY ? '✅' : '❌'}`);
   console.log(`   Email:         ${RESEND_API_KEY && ADMIN_EMAIL ? '✅' : '⚠️  disabled'}`);
   console.log(`   GHL Webhook:   ${GHL_WEBHOOK_URL ? '✅' : '⚠️  not configured'}`);
