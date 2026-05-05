@@ -331,7 +331,8 @@ function buildGhlPayload(data) {
     gcash: 'GCash/PayMaya',
     maya: 'GCash/PayMaya',
     metro: 'Metrobank',
-    land: 'Landbank'
+    land: 'Landbank',
+    cash: 'Cash on Arrival (Walk-in)'
   };
   const paymentMethod = channelLabels[data.payment.channel] || data.payment.channel;
 
@@ -549,8 +550,7 @@ async function createSmoobuDraft(data) {
         adults: adultsPerUnit,
         price: pricePerUnit,
         priceStatus: 0, // unpaid
-        notice: `[WEBSITE ${data.bookingId}] ${data.payment.type.toUpperCase()} | ${data.payment.channel.toUpperCase()} | Ref: ${data.payment.referenceNumber} | AWAITING RECEIPT VERIFICATION${bedSuffix ? ' | ' + bedSuffix.trim() : ''}`,
-        language: 'en',
+        notice: `[WEBSITE ${data.bookingId}] ${data.payment.type.toUpperCase()} | ${data.payment.channel.toUpperCase()} | Ref: ${data.payment.referenceNumber} | ${data.payment.channel === 'cash' ? 'WALK-IN — CASH ON ARRIVAL' : 'AWAITING RECEIPT VERIFICATION'}${bedSuffix ? ' | ' + bedSuffix.trim() : ''}`,        language: 'en',
       };
 
       try {
@@ -602,8 +602,12 @@ async function sendBookingEmail(data) {
   if (!RESEND_API_KEY) return;
 
   const resend = new Resend(RESEND_API_KEY);
-  const channelNames = { gcash: 'GCash', maya: 'Maya', metro: 'Metrobank', land: 'Landbank' };
+  const channelNames = { gcash: 'GCash', maya: 'Maya', metro: 'Metrobank', land: 'Landbank', cash: 'Cash on Arrival (Walk-in)' };
   const payTypeNames = { full: 'Full Payment', dp: 'Downpayment (50%)' };
+  const isCash = data.payment.channel === 'cash';
+  const actionNeededHtml = isCash
+    ? `<strong>⏰ ACTION NEEDED (WALK-IN/CASH):</strong><br>The guest will pay in cash upon arrival. Please confirm the room is ready and reach out via Messenger if you need to clarify the arrival time. <strong>No payment receipt to verify.</strong>`
+    : `<strong>⏰ ACTION NEEDED:</strong><br>Wait for customer's receipt via Messenger (m.me/haidoville), then verify payment and update Smoobu booking status to paid.`;
 
   const roomsHtml = data.rooms.map((r, i) => `
     <tr>
@@ -644,8 +648,7 @@ async function sendBookingEmail(data) {
         <p style="margin:4px 0;"><strong>Grand Total:</strong> ₱${data.payment.grandTotal.toLocaleString()}</p>
 
         <div style="background:#fff;border-left:4px solid #C9A96E;padding:12px;margin-top:20px;border-radius:4px;">
-          <strong>⏰ ACTION NEEDED:</strong><br>
-          Wait for customer's receipt via Messenger (m.me/haidoville), then verify payment and update Smoobu booking status to paid.
+          ${actionNeededHtml}
         </div>
       </div>
     </div>
@@ -655,7 +658,7 @@ async function sendBookingEmail(data) {
     from: `HaidoVille Booking <${FROM_EMAIL}>`,
     to: ADMIN_EMAIL,
     replyTo: data.guest.email,
-    subject: `🏠 New Booking: ${data.bookingId} — ${data.guest.name}`,
+    ssubject: `🏠 New Booking: ${data.bookingId} — ${data.guest.name}${isCash ? ' [WALK-IN/CASH]' : ''}`,
     html,
   });
 
