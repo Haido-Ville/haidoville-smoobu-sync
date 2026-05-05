@@ -1,11 +1,16 @@
 // ============================================================
-// HAIDOVILLE × SMOOBU SYNC - Render.com Server v3.1
+// HAIDOVILLE × SMOOBU SYNC - Render.com Server v3.2
 // ============================================================
-// v3.1 UPDATES:
-// - Added `source` field to GHL payload (for OTA analytics tracking)
-// - Source defaults to "Website (Direct)" if not provided by client
+// v3.2 UPDATES:
+// - FIXED: Bunk Beds now auto-picks FREE apartment units (was always
+//   trying Bunkbed 1, causing "reservation already exists" errors)
+// - Multi-bed bunk bookings now create one draft per bed across
+//   different free apartment units
 //
-// v3 FEATURES (unchanged):
+// v3.1 (kept):
+// - Added `source` field to GHL payload (for OTA analytics tracking)
+//
+// v3 FEATURES (kept):
 // - Forwards booking to GHL webhook (with exact payload format)
 // - Creates Smoobu draft booking (pending, unpaid) to auto-block dates
 // - Email notification via Resend
@@ -50,6 +55,9 @@ const ROOM_NAME_TO_APT_ID = {
   'Bunk Beds': [3261752, 3261757, 3261762, 3261767, 3261772, 3261777],
 };
 
+// All bunk apartment IDs (extracted for easy reference)
+const BUNK_APARTMENT_IDS = ROOM_NAME_TO_APT_ID['Bunk Beds'];
+
 // ---- Cache ----
 let cache = { data: null, timestamp: 0 };
 const pendingBookings = [];
@@ -82,7 +90,7 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => {
   res.json({
     service: 'HaidoVille Smoobu Sync',
-    version: '3.1',
+    version: '3.2',
     status: 'online',
     features: {
       smoobuSync: !!SMOOBU_API_KEY,
@@ -240,7 +248,6 @@ app.post('/bookings/create', async (req, res) => {
     }
 
     // Default source to "Website (Direct)" if client didn't send one
-    // (backward compatibility with older website code versions)
     if (!data.source) {
       data.source = 'Website (Direct)';
     }
@@ -273,7 +280,6 @@ app.post('/bookings/create', async (req, res) => {
     }
 
     // Create Smoobu draft booking to block dates (non-blocking)
-    // Invalidate cache so next GET /bookings call returns fresh data
     if (CREATE_SMOOBU_DRAFT && SMOOBU_API_KEY) {
       createSmoobuDraft(data).then(() => {
         cache = { data: null, timestamp: 0 };
@@ -317,12 +323,10 @@ async function forwardToGHL(data) {
 }
 
 function buildGhlPayload(data) {
-  // Split name into first/last
   const nameParts = (data.guest.name || '').trim().split(/\s+/);
   const firstName = nameParts[0] || '';
   const lastName = nameParts.slice(1).join(' ') || '';
 
-  // Format payment method (matches GHL automation expected format)
   const channelLabels = {
     gcash: 'GCash/PayMaya',
     maya: 'GCash/PayMaya',
@@ -331,10 +335,8 @@ function buildGhlPayload(data) {
   };
   const paymentMethod = channelLabels[data.payment.channel] || data.payment.channel;
 
-  // Get first/primary room for room_type field
   const firstRoom = data.rooms[0] || {};
 
-  // Format dates ("Apr 20, 2026")
   const fmtShortDate = (d) => {
     if (!d) return '';
     try {
@@ -344,12 +346,10 @@ function buildGhlPayload(data) {
     } catch(e) { return d; }
   };
 
-  // Format confirmation date ("April 16, 2026")
   const confirmationDate = new Date(data.submittedAt || new Date()).toLocaleDateString('en-US', {
     month: 'long', day: 'numeric', year: 'numeric', timeZone: 'Asia/Manila'
   });
 
-  // Format times ("10:52 PM")
   const fmtTime12 = (t) => {
     if (!t) return '';
     const parts = t.split(':');
@@ -360,33 +360,25 @@ function buildGhlPayload(data) {
     return h + ':' + m + ' ' + ampm;
   };
 
-  // Compute totals
   const grandTotal = data.payment.grandTotal || 0;
   const dpAmount = data.payment.type === 'full' ? grandTotal : Math.ceil(grandTotal * 0.5);
   const balance = data.payment.type === 'full' ? 0 : grandTotal - dpAmount;
 
-  // Combine all rooms if multiple
   let roomType = firstRoom.name || '';
   if (data.rooms.length > 1) {
     roomType = data.rooms.map(r => r.name).join(' + ');
   }
 
-  // Total pax (sum all rooms)
   const totalPax = data.rooms.reduce((sum, r) => sum + (parseInt(r.pax) || 0), 0);
   const totalNights = firstRoom.nights || 0;
 
   return {
-    // === BOOKING SOURCE (analytics tracking) ===
     source: data.source || 'Website (Direct)',
-
-    // === CONTACT DETAILS ===
     email: data.guest.email || '',
     phone: data.guest.phone || '',
     first_name: firstName,
     last_name: lastName,
     name: data.guest.name || '',
-
-    // === BOOKING DETAILS ===
     booking_id: data.bookingId,
     confirmation_date: confirmationDate,
     guest_name: data.guest.name || '',
@@ -403,8 +395,6 @@ function buildGhlPayload(data) {
     port_of_arrival: data.guest.port || '',
     no_of_nights: String(totalNights),
     no_of_guests: String(totalPax),
-
-    // === PAYMENT DETAILS ===
     payment_method: paymentMethod,
     payment_ref: data.payment.referenceNumber || '',
     total_amount: String(grandTotal),
@@ -412,8 +402,6 @@ function buildGhlPayload(data) {
     balance: String(balance),
     payment_type: data.payment.type === 'full' ? 'Full Payment' : 'Downpayment (50%)',
     special_request: data.guest.specialRequest || '',
-
-    // === ROOMS ARRAY (for multi-room bookings) ===
     room_count: String(data.rooms.length),
     all_rooms: data.rooms.map(r => ({
       name: r.name,
@@ -427,61 +415,179 @@ function buildGhlPayload(data) {
 }
 
 // ============================================================
+// 🆕 NEW HELPER: Find available Bunk apartments for a date range
+// ============================================================
+// Queries Smoobu for existing bookings in the requested range and
+// returns a list of bunk apartment IDs that are FREE.
+async function findAvailableBunkApartments(checkIn, checkOut) {
+  if (!SMOOBU_API_KEY) return [];
+
+  try {
+    const url = new URL('https://login.smoobu.com/api/reservations');
+    url.searchParams.set('from', checkIn);
+    url.searchParams.set('to', checkOut);
+    url.searchParams.set('pageSize', '100');
+    url.searchParams.set('excludeBlocked', 'false');
+
+    const response = await fetch(url.toString(), {
+      headers: { 'Api-Key': SMOOBU_API_KEY, 'Cache-Control': 'no-cache' },
+    });
+
+    if (!response.ok) {
+      console.warn('[Bunk Picker] Smoobu fetch failed, returning all bunk apts as fallback');
+      return [...BUNK_APARTMENT_IDS];
+    }
+
+    const data = await response.json();
+    const bookings = data.bookings || [];
+
+    // Find bunk apartment IDs that have a conflicting booking
+    const bookedIds = new Set();
+    for (const b of bookings) {
+      if (b.type === 'cancellation') continue;
+      const aptId = b.apartment?.id;
+      if (!BUNK_APARTMENT_IDS.includes(aptId)) continue;
+
+      // Standard overlap check: [b.arrival, b.departure) ∩ [checkIn, checkOut)
+      if (b.arrival && b.departure
+          && b.arrival < checkOut
+          && b.departure > checkIn) {
+        bookedIds.add(aptId);
+      }
+    }
+
+    const freeIds = BUNK_APARTMENT_IDS.filter(id => !bookedIds.has(id));
+
+    console.log('[Bunk Picker]', checkIn, '→', checkOut,
+                '| booked:', bookedIds.size,
+                '| free:', freeIds.length,
+                '| free IDs:', freeIds);
+
+    return freeIds;
+  } catch (err) {
+    console.error('[Bunk Picker] Error:', err.message);
+    // Safe fallback: return all bunk IDs (Smoobu will reject duplicates anyway)
+    return [...BUNK_APARTMENT_IDS];
+  }
+}
+
+// ============================================================
 // HELPER: Create Smoobu Draft Booking (auto-block dates)
 // ============================================================
+// 🆕 v3.2: For Bunk Beds, now creates one draft per bed across DIFFERENT
+//          free apartment units (was always trying Bunkbed 1 → caused
+//          "reservation already exists" errors).
 async function createSmoobuDraft(data) {
   if (!CREATE_SMOOBU_DRAFT || !SMOOBU_API_KEY) return;
 
   for (const room of data.rooms) {
-    const apartmentId = resolveApartmentId(room.name);
-    if (!apartmentId) {
-      console.warn('[Smoobu Draft] Unknown room:', room.name);
-      continue;
+    const isBunk = room.name === 'Bunk Beds';
+    const bedsNeeded = parseInt(room.pax) || 1;
+
+    // ── Determine which apartment IDs to book ──
+    let apartmentIds = [];
+
+    if (isBunk) {
+      const freeApts = await findAvailableBunkApartments(room.checkIn, room.checkOut);
+
+      if (freeApts.length < bedsNeeded) {
+        console.warn(
+          '[Smoobu Draft] Not enough free bunk apartments.',
+          'Requested:', bedsNeeded,
+          'Free:', freeApts.length,
+          'BookingId:', data.bookingId
+        );
+
+        // Still try to book what's available so dates get partially blocked
+        if (freeApts.length === 0) {
+          console.warn('[Smoobu Draft] Skipping — no free bunk apartments at all.');
+          continue;
+        }
+      }
+
+      apartmentIds = freeApts.slice(0, bedsNeeded);
+    } else {
+      const aptId = resolveApartmentId(room.name);
+      if (!aptId) {
+        console.warn('[Smoobu Draft] Unknown room:', room.name);
+        continue;
+      }
+      apartmentIds = [aptId];
     }
 
-    // Split name
+    // ── Split name ──
     const nameParts = (data.guest.name || '').trim().split(/\s+/);
     const firstName = nameParts[0] || 'Guest';
     const lastName = nameParts.slice(1).join(' ') || '(Pending)';
 
-    const payload = {
-      arrivalDate: room.checkIn,
-      departureDate: room.checkOut,
-      apartmentId: apartmentId,
-      channelId: 70, // Direct booking
-      firstName: firstName,
-      lastName: lastName,
-      email: data.guest.email,
-      phone: data.guest.phone,
-      adults: parseInt(room.pax) || 1,
-      price: room.subtotal,
-      priceStatus: 0, // unpaid
-      notice: `[WEBSITE ${data.bookingId}] ${data.payment.type.toUpperCase()} | ${data.payment.channel.toUpperCase()} | Ref: ${data.payment.referenceNumber} | AWAITING RECEIPT VERIFICATION`,
-      language: 'en',
-    };
+    // ── Compute per-unit price/adults ──
+    // For bunk: split price evenly per bed (1 adult per bed).
+    // For others: full price + full pax.
+    const unitsToCreate = apartmentIds.length;
+    const isMulti = unitsToCreate > 1;
+    const pricePerUnit = isBunk
+      ? Math.round((room.subtotal || 0) / Math.max(1, bedsNeeded))
+      : (room.subtotal || 0);
+    const adultsPerUnit = isBunk ? 1 : (parseInt(room.pax) || 1);
 
-    try {
-      const response = await fetch('https://login.smoobu.com/api/reservations', {
-        method: 'POST',
-        headers: {
-          'Api-Key': SMOOBU_API_KEY,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-      });
+    // ── Create one Smoobu draft per apartment ──
+    for (let i = 0; i < apartmentIds.length; i++) {
+      const apartmentId = apartmentIds[i];
+      const bedSuffix = isBunk && isMulti
+        ? ` (Bed ${i + 1}/${unitsToCreate})`
+        : '';
 
-      const result = await response.json();
-      if (response.ok) {
-        console.log('[Smoobu Draft Created]', data.bookingId, 'room:', room.name, 'smoobuId:', result.id);
-      } else {
-        console.warn('[Smoobu Draft Failed]', JSON.stringify(result));
+      const payload = {
+        arrivalDate: room.checkIn,
+        departureDate: room.checkOut,
+        apartmentId: apartmentId,
+        channelId: 70, // Direct booking
+        firstName: firstName,
+        lastName: lastName + bedSuffix,
+        email: data.guest.email,
+        phone: data.guest.phone,
+        adults: adultsPerUnit,
+        price: pricePerUnit,
+        priceStatus: 0, // unpaid
+        notice: `[WEBSITE ${data.bookingId}] ${data.payment.type.toUpperCase()} | ${data.payment.channel.toUpperCase()} | Ref: ${data.payment.referenceNumber} | AWAITING RECEIPT VERIFICATION${bedSuffix ? ' | ' + bedSuffix.trim() : ''}`,
+        language: 'en',
+      };
+
+      try {
+        const response = await fetch('https://login.smoobu.com/api/reservations', {
+          method: 'POST',
+          headers: {
+            'Api-Key': SMOOBU_API_KEY,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+
+        const result = await response.json();
+        if (response.ok) {
+          console.log(
+            '[Smoobu Draft Created]',
+            data.bookingId,
+            'room:', room.name + bedSuffix,
+            'aptId:', apartmentId,
+            'smoobuId:', result.id
+          );
+        } else {
+          console.warn(
+            '[Smoobu Draft Failed]',
+            'aptId:', apartmentId,
+            'room:', room.name + bedSuffix,
+            JSON.stringify(result)
+          );
+        }
+      } catch (err) {
+        console.error('[Smoobu Draft Network Error]', err.message);
       }
-    } catch (err) {
-      console.error('[Smoobu Draft Network Error]', err.message);
     }
   }
 }
 
+// ── Kept as-is for non-bunk rooms (Barkada/Couple/Family Room 1 & 2) ──
 function resolveApartmentId(roomName) {
   const mapping = ROOM_NAME_TO_APT_ID[roomName];
   if (!mapping) return null;
@@ -560,7 +666,7 @@ async function sendBookingEmail(data) {
 // Start server
 // ============================================================
 app.listen(PORT, () => {
-  console.log(`🚀 HaidoVille Smoobu Sync v3.1 running on port ${PORT}`);
+  console.log(`🚀 HaidoVille Smoobu Sync v3.2 running on port ${PORT}`);
   console.log(`   Smoobu API:    ${SMOOBU_API_KEY ? '✅' : '❌'}`);
   console.log(`   Email:         ${RESEND_API_KEY && ADMIN_EMAIL ? '✅' : '⚠️  disabled'}`);
   console.log(`   GHL Webhook:   ${GHL_WEBHOOK_URL ? '✅' : '⚠️  not configured'}`);
