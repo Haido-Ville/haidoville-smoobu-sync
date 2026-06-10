@@ -16,13 +16,9 @@
 // Yung Step 1–4 flow, cart system, Holy Week logic — lahat nanatili.
 // ============================================================
 
-// ⚠️ FIXED OPTION: Secure validation header key matching your server env
-const CALENDAR_ACCESS_TOKEN = process.env.CALENDAR_ACCESS_TOKEN; 
-const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
-
 // ⚠️ PALITAN MO ITO NG ACTUAL RENDER URL MO AFTER DEPLOY
 // Example: 'https://haidoville-smoobu-sync.onrender.com/bookings'
-const SMOOBU_PROXY_URL = process.env.SMOOBU_PROXY_URL;
+const SMOOBU_PROXY_URL = 'https://haidoville-smoobu-sync.onrender.com/bookings';
 
 async function hvLoadBooked() {
   // Reset arrays first
@@ -37,7 +33,7 @@ async function hvLoadBooked() {
     const timeoutId = setTimeout(() => controller.abort(), 35000);
 
     const response = await fetch(SMOOBU_PROXY_URL, {
-      signal: controller.signal
+      signal: controller.signal,
     });
     clearTimeout(timeoutId);
 
@@ -86,21 +82,13 @@ async function hvLoadBooked() {
 
 (function hvKeepAlive() {
   // Same URL as above but without /bookings (yung root na health check)
-  const HEALTH_URL = SMOOBU_PROXY_URL.replace(/\/[^/]+$/, '/');
-
-  const fetchOptions = {
-    method: 'GET',
-    headers: {
-      'X-API-Key': INTERNAL_API_KEY // Injected to authorize background wakeups
-    }
-  };
+  const HEALTH_URL = SMOOBU_PROXY_URL.replace(/\/bookings$/, '/');
 
   // Ping once immediately (so yung server magising kaagad)
-  fetch(HEALTH_URL, fetchOptions).catch(() => {});
+  fetch(HEALTH_URL, { method: 'GET', mode: 'no-cors' }).catch(() => {});
 
   // Ping every 10 minutes para hindi matulog (kung active yung tab)
   setInterval(() => {
-    fetch(HEALTH_URL, fetchOptions).catch(() => {});
+    fetch(HEALTH_URL, { method: 'GET', mode: 'no-cors' }).catch(() => {});
   }, 10 * 60 * 1000);
 })();
-
