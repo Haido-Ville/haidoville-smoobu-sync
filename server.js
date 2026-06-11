@@ -257,7 +257,17 @@ const bookingRateLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: {
-    error: "Too many booking requests. Please wait a moment and try again.",
+    error: "Too many requests. Please wait a moment and try again.",
+  },
+});
+
+const tokenRateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Too many requests. Please wait a moment and try again.",
   },
 });
 
@@ -495,7 +505,7 @@ function buildAvailabilityResult(allBookings) {
 // ============================================================
 // GET /booking-token  (public — issues one-time JWT)
 // ============================================================
-app.get("/booking-token", (req, res) => {
+app.get("/booking-token", tokenRateLimiter, (req, res) => {
   const jti = uuidv4();
   const token = jwt.sign({ jti }, JWT_SECRET, { expiresIn: JWT_EXPIRATION });
   res.json({ token });
