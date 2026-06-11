@@ -20,6 +20,24 @@
 // Example: 'https://haidoville-smoobu-sync.onrender.com/availability'
 const SMOOBU_PROXY_URL = 'https://haidoville-smoobu-sync.onrender.com/availability';
 
+// ---- Helper: Decrypt an encrypted response via backend ----
+async function hvDecrypt(encryptedData) {
+  const decryptUrl = SMOOBU_PROXY_URL.replace(/\/availability$/, '/decrypt');
+  const response = await fetch(decryptUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      payload: encryptedData.payload,
+      iv: encryptedData.iv,
+      tag: encryptedData.tag,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error('Decryption failed: ' + response.status);
+  }
+  return response.json();
+}
+
 async function hvLoadBooked() {
   // Reset arrays first
   bookedRanges = [];
@@ -42,7 +60,12 @@ async function hvLoadBooked() {
       return [];
     }
 
-    const data = await response.json();
+    let data = await response.json();
+
+    // Handle encrypted responses from backend v3.7+
+    if (data._encrypted) {
+      data = await hvDecrypt(data);
+    }
 
     // Populate global arrays used by the calendar
     if (Array.isArray(data.bookedRanges)) {
@@ -70,6 +93,7 @@ async function hvLoadBooked() {
     return [];
   }
 }
+
 
 
 // ============================================================

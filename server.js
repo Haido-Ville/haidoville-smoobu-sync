@@ -1,9 +1,12 @@
 // ============================================================
-// HAIDOVILLE × SMOOBU SYNC - Render.com Server v3.6
+// HAIDOVILLE × SMOOBU SYNC - Render.com Server v3.7
 // ============================================================
-// v3.6 FIXES:
-// - ADDED: GET /ping — public no-auth endpoint for keep-alive / UptimeRobot
-// - All other endpoints and security measures unchanged from v3.5
+// v3.7 CHANGES:
+// - ADDED: AES-256-GCM encryption on /availability, /booking-token,
+//          and /bookings/create responses (encryption.js module)
+// - ADDED: POST /decrypt — frontend decryption endpoint
+// - Key derived via PBKDF2 x600k iterations (bcrypt-equivalent)
+// - All other endpoints and security measures unchanged from v3.6
 // ============================================================
 
 import express from "express";
@@ -14,6 +17,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
+import { encryptResponse, handleDecrypt } from "./encryption.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -286,26 +290,30 @@ app.get("/ping", (req, res) => {
 // GET /  — Protected health check (internal use only)
 // ============================================================
 app.get("/", requireApiKey, (req, res) => {
-  res.json({
-    service: "HaidoVille Smoobu Sync",
-    version: "3.6",
-    status: "online",
-    features: {
-      smoobuSync: !!SMOOBU_API_KEY,
-      email: !!RESEND_API_KEY && !!ADMIN_EMAIL,
-      ghlWebhook: !!GHL_WEBHOOK_URL,
-      smoobuDraft: CREATE_SMOOBU_DRAFT && !!SMOOBU_API_KEY,
-    },
-    endpoints: {
-      ping: "GET /ping",
-      availability: "GET /availability",
-      bookings: "GET /bookings",
-      bookingToken: "GET /booking-token",
-      apartments: "GET /apartments-list",
-      createBooking: "POST /bookings/create",
-    },
-    timestamp: new Date().toISOString(),
-  });
+  res.json(
+    encryptResponse({
+      service: "HaidoVille Smoobu Sync",
+      version: "3.7",
+      status: "online",
+      features: {
+        smoobuSync: !!SMOOBU_API_KEY,
+        email: !!RESEND_API_KEY && !!ADMIN_EMAIL,
+        ghlWebhook: !!GHL_WEBHOOK_URL,
+        smoobuDraft: CREATE_SMOOBU_DRAFT && !!SMOOBU_API_KEY,
+        encryption: "AES-256-GCM",
+      },
+      endpoints: {
+        ping: "GET /ping",
+        availability: "GET /availability (encrypted)",
+        bookings: "GET /bookings (encrypted)",
+        bookingToken: "GET /booking-token (encrypted)",
+        apartments: "GET /apartments-list (encrypted)",
+        createBooking: "POST /bookings/create (encrypted)",
+        decrypt: "POST /decrypt",
+      },
+      timestamp: new Date().toISOString(),
+    })
+  );
 });
 
 // ============================================================
@@ -328,12 +336,14 @@ app.get("/apartments-list", requireApiKey, async (req, res) => {
     apartments.forEach((apt) => {
       sampleMapping[apt.id] = `'${apt.name}'`;
     });
-    res.json({
-      instructions: "Copy IDs at gamitin sa APARTMENT_MAP",
-      totalApartments: apartments.length,
-      apartments,
-      sampleMapping,
-    });
+    res.json(
+      encryptResponse({
+        instructions: "Copy IDs at gamitin sa APARTMENT_MAP",
+        totalApartments: apartments.length,
+        apartments,
+        sampleMapping,
+      })
+    );
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -351,7 +361,7 @@ app.get("/bookings", requireCalendarAccess, async (req, res) => {
   if (!nocache && cache.data && now - cache.timestamp < CACHE_DURATION_MS) {
     res.setHeader("X-Cache", "HIT");
     res.setHeader("X-Cache-Age", Math.floor((now - cache.timestamp) / 1000));
-    return res.json(cache.data);
+    return res.json(encryptResponse(cache.data));
   }
 
   try {
@@ -403,7 +413,7 @@ app.get("/bookings", requireCalendarAccess, async (req, res) => {
     const result = buildAvailabilityResult(allBookings);
     cache = { data: result, timestamp: now };
     res.setHeader("X-Cache", "MISS");
-    res.json(result);
+    res.json(encryptResponse(result));
   } catch (err) {
     res.status(500).json({ error: "Server error", message: err.message });
   }
@@ -417,7 +427,7 @@ app.get("/availability", async (req, res) => {
   if (cache.data && now - cache.timestamp < CACHE_DURATION_MS) {
     res.setHeader("X-Cache", "HIT");
     res.setHeader("X-Cache-Age", Math.floor((now - cache.timestamp) / 1000));
-    return res.json(cache.data);
+    return res.json(encryptResponse(cache.data));
   }
 
   if (!SMOOBU_API_KEY)
@@ -456,7 +466,7 @@ app.get("/availability", async (req, res) => {
     const result = buildAvailabilityResult(allBookings);
     cache = { data: result, timestamp: now };
     res.setHeader("X-Cache", "MISS");
-    res.json(result);
+    res.json(encryptResponse(result));
   } catch (err) {
     res.status(500).json({ error: "Server error", message: err.message });
   }
@@ -508,8 +518,13 @@ function buildAvailabilityResult(allBookings) {
 app.get("/booking-token", tokenRateLimiter, (req, res) => {
   const jti = uuidv4();
   const token = jwt.sign({ jti }, JWT_SECRET, { expiresIn: JWT_EXPIRATION });
-  res.json({ token });
+  res.json(encryptResponse({ token }));
 });
+
+// ============================================================
+// POST /decrypt  — Frontend decryption endpoint
+// ============================================================
+app.post("/decrypt", bookingRateLimiter, handleDecrypt);
 
 // ============================================================
 // POST /bookings/create
@@ -687,11 +702,14 @@ app.post(
           .catch((err) => console.error("[Smoobu Draft Error]", err.message));
       }
 
-      res.json({
-        success: true,
-        bookingId: data.bookingId,
-        message: "Booking logged securely. Please send receipt via Messenger.",
-      });
+      res.json(
+        encryptResponse({
+          success: true,
+          bookingId: data.bookingId,
+          message:
+            "Booking logged securely. Please send receipt via Messenger.",
+        }),
+      );
     } catch (err) {
       console.error("[Booking Create Error]", err);
       res.status(500).json({ error: "Server error", message: err.message });
