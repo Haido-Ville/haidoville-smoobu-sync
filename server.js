@@ -598,6 +598,19 @@ app.post(
         paxLabel: String(room.paxLabel || "Guests"),
       }));
 
+      for (const room of sanitizedRooms) {
+        const ci = new Date(room.checkIn + 'T00:00:00');
+        const co = new Date(room.checkOut + 'T00:00:00');
+        const stayNights = Math.round(
+          (co - ci) / 86400000
+        );
+        if (stayNights < 2) {
+          return res.status(400).json({
+            error: 'Minimum stay is 2 nights.',
+          });
+        }
+      }
+      
       let calculatedGrandTotal = 0;
       const finalProcessedRooms = sanitizedRooms.map((room) => {
         const calculatedSubtotal = calculateRoomPrice(
@@ -1085,7 +1098,10 @@ function buildGhlPayload(data) {
     (sum, r) => sum + (parseInt(r.pax) || 0),
     0,
   );
-  const totalNights = firstRoom.nights || 0;
+
+ const totalNights = data.rooms.reduce(
+    (sum, r) => sum + (parseInt(r.nights) || 0), 0
+  );
 
   return {
     source: data.source || "Website (Direct)",
@@ -1109,6 +1125,8 @@ function buildGhlPayload(data) {
     departure_time: fmtTime12(data.guest.departureTime),
     port_of_arrival: data.guest.port || "",
     no_of_nights: String(totalNights),
+    primary_check_in: fmtShortDate(firstRoom.checkIn),
+    primary_check_out: fmtShortDate(firstRoom.checkOut),
     no_of_guests: String(totalPax),
     payment_method: paymentMethod,
     payment_ref: data.payment.referenceNumber || "",
