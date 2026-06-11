@@ -99,6 +99,53 @@ console.log(
   `[Refs] Loaded ${processedReferenceNumbers.size} persisted reference number(s).`,
 );
 
+// ---- Persistent Booking ID store ----
+const BOOKING_IDS_FILE = path.join(__dirname, "booking_ids.json");
+
+function loadPersistedBookingIds() {
+  try {
+    if (fs.existsSync(BOOKING_IDS_FILE)) {
+      const raw = fs.readFileSync(BOOKING_IDS_FILE, "utf8");
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) return new Set(arr);
+    }
+  } catch (err) {
+    console.warn("[BookingIDs] Could not load booking_ids.json, starting fresh:", err.message);
+  }
+  return new Set();
+}
+
+function persistBookingIds(set) {
+  try {
+    const arr = [...set].slice(-10000);
+    fs.writeFileSync(BOOKING_IDS_FILE, JSON.stringify(arr), "utf8");
+  } catch (err) {
+    console.error("[BookingIDs] Failed to persist booking_ids.json:", err.message);
+  }
+}
+
+function generateUniqueBookingId() {
+  const now = new Date();
+  const yymm =
+    String(now.getFullYear()).slice(-2) +
+    String(now.getMonth() + 1).padStart(2, "0");
+  let id;
+  let attempts = 0;
+  do {
+    const serial = String(Math.floor(1000 + Math.random() * 9000));
+    id = `HV-${yymm}-${serial}`;
+    attempts++;
+    if (attempts > 50) {
+      id = `HV-${yymm}-${Date.now().toString().slice(-4)}`;
+      break;
+    }
+  } while (processedBookingIds.has(id));
+  return id;
+}
+
+const processedBookingIds = loadPersistedBookingIds();
+console.log(`[BookingIDs] Loaded ${processedBookingIds.size} persisted booking ID(s).`);
+
 // ---- Server-Side Pricing Function ----
 function calculateRoomPrice(roomName, pax, nights, checkIn, checkOut) {
   nights = Math.max(1, nights);
@@ -478,6 +525,7 @@ function buildAvailabilityResult(allBookings) {
     bookedRanges: [],
     bunkBookings: [],
     familyBookedUnits: [],
+    bunktotal: BUNK_APARTMENT_IDS.length,
     updatedAt: new Date().toISOString(),
     totalBookings: allBookings.length,
   };
@@ -626,7 +674,22 @@ app.post(
 
       if (SMOOBU_API_KEY) {
         for (const room of sanitizedRooms) {
-          if (room.name === "Bunk Beds") continue;
+          if (room.name === "Bunk Beds") {
+            const bedsNeeded = parseInt(room.pax) || 1;
+            const freeApts = await findAvailableBunkApartments(
+              room.checkIn,
+              room.checkOut,
+            );
+            if (freeApts.length < bedsNeeded) {
+              console.warn(
+                `[Availability] Bunk Beds: need ${bedsNeeded} beds, only ${freeApts.length} free for ${room.checkIn} → ${room.checkOut}.`,
+              );
+              return res.status(409).json({
+                error: `Not enough bunk beds available for the selected dates. Only ${freeApts.length} bed${freeApts.length !== 1 ? "s" : ""} left — you requested ${bedsNeeded}. Please adjust your dates or number of beds.`,
+              });
+            }
+            continue;
+          }
           const aptId = NON_BUNK_ROOM_APT_IDS[room.name];
           if (!aptId) continue;
           const isAvailable = await checkNonBunkAvailability(
@@ -645,7 +708,12 @@ app.post(
         }
       }
 
+      const VALID_CHANNELS = ["gcash","maya","metro","land","cash"];
       const paymentChannel = String(rawData.payment.channel);
+      if (!VALID_CHANNELS.includes(paymentChannel)) {
+        return res.status(400).json({ error: "Invalid payment channel." });
+      }
+
       const paymentType =
         String(rawData.payment.type) === "full" ? "full" : "dp";
       const finalAmountPaid =
@@ -952,6 +1020,15 @@ function resolveApartmentId(roomName) {
 async function sendBookingEmail(data) {
   if (!RESEND_API_KEY) return;
 
+  const esc = (s) =>
+    String(s ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#x27;");
+
+
   const resend = new Resend(RESEND_API_KEY);
   const channelNames = {
     gcash: "GCash",
@@ -989,14 +1066,14 @@ async function sendBookingEmail(data) {
       </div>
       <div style="background:#f9f9f9;padding:20px;border-radius:0 0 12px 12px;">
         <h3 style="margin-top:0;color:#C9A96E;">👤 Guest Details</h3>
-        <p style="margin:4px 0;"><strong>Name:</strong> ${data.guest.name}</p>
-        <p style="margin:4px 0;"><strong>Email:</strong> ${data.guest.email}</p>
-        <p style="margin:4px 0;"><strong>Phone:</strong> ${data.guest.phone}</p>
-        ${data.guest.nationality ? `<p style="margin:4px 0;"><strong>Nationality:</strong> ${data.guest.nationality}</p>` : ""}
-        ${data.guest.address ? `<p style="margin:4px 0;"><strong>Address:</strong> ${data.guest.address}</p>` : ""}
-        ${data.guest.arrivalTime ? `<p style="margin:4px 0;"><strong>Arrival Time:</strong> ${data.guest.arrivalTime}</p>` : ""}
-        ${data.guest.port ? `<p style="margin:4px 0;"><strong>Port:</strong> ${data.guest.port}</p>` : ""}
-        ${data.guest.specialRequest ? `<p style="margin:4px 0;"><strong>Special Request:</strong> ${data.guest.specialRequest}</p>` : ""}
+        <p style="margin:4px 0;"><strong>Name:</strong> ${esc(data.guest.name)}</p>
+        <p style="margin:4px 0;"><strong>Email:</strong> ${esc(data.guest.email)}</p>
+        <p style="margin:4px 0;"><strong>Phone:</strong> ${esc(data.guest.phone)}</p>
+        ${data.guest.nationality ? `<p style="margin:4px 0;"><strong>Nationality:</strong> ${esc(data.guest.nationality)}</p>` : ""}
+        ${data.guest.address ? `<p style="margin:4px 0;"><strong>Address:</strong> ${esc(data.guest.address)}</p>` : ""}
+        ${data.guest.arrivalTime ? `<p style="margin:4px 0;"><strong>Arrival Time:</strong> ${esc(data.guest.arrivalTime)}</p>` : ""}
+        ${data.guest.port ? `<p style="margin:4px 0;"><strong>Port:</strong> ${esc(data.guest.port)}</p>` : ""}
+        ${data.guest.specialRequest ? `<p style="margin:4px 0;"><strong>Special Request:</strong> ${esc(data.guest.specialRequest)}</p>` : ""}
         <h3 style="color:#C9A96E;margin-top:20px;">🛏️ Rooms</h3>
         <table style="width:100%;border-collapse:collapse;">${roomsHtml}</table>
         <h3 style="color:#C9A96E;margin-top:20px;">💰 Payment Details (Server Verified)</h3>
@@ -1099,9 +1176,7 @@ function buildGhlPayload(data) {
     0,
   );
 
- const totalNights = data.rooms.reduce(
-    (sum, r) => sum + (parseInt(r.nights) || 0), 0
-  );
+  const totalNights = Math.max(...data.rooms.map((r) => parseInt(r.nights) || 0));
 
   return {
     source: data.source || "Website (Direct)",
