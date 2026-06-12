@@ -120,7 +120,7 @@ export function encryptResponse(data) {
 }
 
 // ============================================================
-// POST /decrypt endpoint handler
+// POST /api/bootstrap/context endpoint handler
 // ============================================================
 // Decrypts a payload sent by the frontend.
 // Body: { payload, iv, tag }
