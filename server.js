@@ -17,7 +17,12 @@ import path from "path";
 import { fileURLToPath } from "url";
 import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
-import { encryptResponse, handleDecrypt } from "./encryption.js";
+import {
+  encryptResponse,
+  encryptResponseForBrowser,
+  generateHint,
+  verifyHint,
+} from "./encryption.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -37,6 +42,8 @@ const CREATE_SMOOBU_DRAFT = process.env.CREATE_SMOOBU_DRAFT === "true";
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
 const CALENDAR_ACCESS_TOKEN = process.env.CALENDAR_ACCESS_TOKEN;
 const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_CURR_SEC = process.env.JWT_CURR_SEC || JWT_SECRET;
+const JWT_PREV_SEC = process.env.JWT_PREV_SEC || JWT_SECRET;
 const JWT_EXPIRATION = process.env.JWT_EXPIRATION || "10m";
 
 // ============================================================
@@ -193,7 +200,7 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader(
       "Access-Control-Allow-Headers",
-      "Content-Type, X-API-Key, X-Calendar-Access, Authorization",
+      "Content-Type, X-API-Key, X-Calendar-Access, Authorization, X-Session-Hint"
     );
   } else {
     res.setHeader("Access-Control-Allow-Origin", "https://haidoville.com");
@@ -236,24 +243,34 @@ const requireJwtToken = (req, res, next) => {
       });
   }
   const token = authHeader.split(" ")[1];
+  let decoded;
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (usedTokens.has(decoded.jti)) {
-      return res
-        .status(401)
-        .json({ error: "Token already used (one-time use only)." });
-    }
-    usedTokens.set(decoded.jti, decoded.exp * 1000);
-    if (usedTokens.size > 1000) {
-      const now = Date.now();
-      for (const [id, exp] of usedTokens) {
-        if (now > exp) usedTokens.delete(id);
+    decoded = jwt.verify(token, JWT_CURR_SEC);
+  } catch (e1) {
+    try {
+      decoded = jwt.verify(token, JWT_PREV_SEC);
+    } catch (e2) {
+      try {
+        decoded = jwt.verify(token, JWT_SECRET);
+      } catch (e3) {
+        return res.status(403).json({ error: "Invalid or expired token." });
       }
     }
-    next();
-  } catch (err) {
-    return res.status(403).json({ error: "Invalid or expired token." });
   }
+
+  if (usedTokens.has(decoded.jti)) {
+    return res
+      .status(401)
+      .json({ error: "Token already used (one-time use only)." });
+  }
+  usedTokens.set(decoded.jti, decoded.exp * 1000);
+  if (usedTokens.size > 1000) {
+    const now = Date.now();
+    for (const [id, exp] of usedTokens) {
+      if (now > exp) usedTokens.delete(id);
+    }
+  }
+  next();
 };
 
 // ============================================================
@@ -424,14 +441,80 @@ app.get("/bookings", requireCalendarAccess, async (req, res) => {
 });
 
 // ============================================================
+// SESSION TOKENS — capped uses, self-expiring
+// ============================================================
+const sessionTokens = new Map(); // hint -> { usesLeft, exp }
+const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS) || 10 * 60 * 1000;
+const SESSION_MAX_USES = parseInt(process.env.SESSION_MAX_USES) || 15;
+
+function cleanupSessionTokens() {
+  const now = Date.now();
+  for (const [hint, session] of sessionTokens) {
+    if (now > session.exp || session.usesLeft <= 0) sessionTokens.delete(hint);
+  }
+}
+
+const requireSessionHint = (req, res, next) => {
+  const header = req.headers["x-session-hint"] || "";
+  const parts = header.split(".");
+  if (parts.length !== 3) {
+    return res.status(400).json({ error: "Missing or malformed session hint." });
+  }
+  const [hint, ts, sig] = parts;
+  try {
+    verifyHint(hint, ts, sig);
+    
+    // Check use-limits
+    const session = sessionTokens.get(hint);
+    if (!session) {
+      return res.status(401).json({ error: "Session expired, reload the page" });
+    }
+    if (Date.now() > session.exp) {
+      sessionTokens.delete(hint);
+      return res.status(401).json({ error: "Session expired, reload the page" });
+    }
+    if (session.usesLeft <= 0) {
+      sessionTokens.delete(hint);
+      return res.status(401).json({ error: "Session expired, reload the page" });
+    }
+
+    session.usesLeft -= 1;
+    if (session.usesLeft <= 0) sessionTokens.delete(hint);
+    if (sessionTokens.size > 500) cleanupSessionTokens();
+
+    req.sessionHint = hint;
+    next();
+  } catch (err) {
+    return res.status(403).json({ error: `Invalid session hint: ${err.message}` });
+  }
+};
+
+// ============================================================
+// GET /api/session-hint  — Issues a signed hint per page-load
+// ============================================================
+app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
+  try {
+    const { hint, ts, sig } = generateHint();
+    sessionTokens.set(hint, {
+      usesLeft: SESSION_MAX_USES,
+      exp: Date.now() + SESSION_TTL_MS,
+    });
+    res.json({ hint: `${hint}.${ts}.${sig}` });
+  } catch (err) {
+    console.error("[session-hint] Failed:", err.message);
+    res.status(500).json({ error: "Could not generate session hint." });
+  }
+});
+
+// ============================================================
 // GET /availability  (public — no auth, no PII)
 // ============================================================
-app.get("/availability", async (req, res) => {
+app.get("/availability", requireSessionHint, async (req, res) => {
   const now = Date.now();
   if (cache.data && now - cache.timestamp < CACHE_DURATION_MS) {
     res.setHeader("X-Cache", "HIT");
     res.setHeader("X-Cache-Age", Math.floor((now - cache.timestamp) / 1000));
-    return res.json(encryptResponse(cache.data));
+    return res.json(encryptResponseForBrowser(cache.data, req.sessionHint));
   }
 
   if (!SMOOBU_API_KEY)
@@ -470,7 +553,7 @@ app.get("/availability", async (req, res) => {
     const result = buildAvailabilityResult(allBookings);
     cache = { data: result, timestamp: now };
     res.setHeader("X-Cache", "MISS");
-    res.json(encryptResponse(result));
+    res.json(encryptResponseForBrowser(result, req.sessionHint));
   } catch (err) {
     res.status(500).json({ error: "Server error", message: err.message });
   }
@@ -520,23 +603,20 @@ function buildAvailabilityResult(allBookings) {
 // ============================================================
 // GET /booking-token  (public — issues one-time JWT)
 // ============================================================
-app.get("/booking-token", tokenRateLimiter, (req, res) => {
+app.get("/booking-token", tokenRateLimiter, requireSessionHint, (req, res) => {
   const jti = uuidv4();
-  const token = jwt.sign({ jti }, JWT_SECRET, { expiresIn: JWT_EXPIRATION });
-  res.json(encryptResponse({ token }));
+  // Sign new tokens with the current rotating key
+  const token = jwt.sign({ jti }, JWT_CURR_SEC, { expiresIn: JWT_EXPIRATION });
+  res.json(encryptResponseForBrowser({ token }, req.sessionHint));
 });
 
-// ============================================================
-// POST /api/bootstrap/context  — Frontend decryption endpoint
-// ============================================================
-app.post("/api/bootstrap/context", bookingRateLimiter, handleDecrypt);
 
-// ============================================================
-// POST /bookings/create
+
 // ============================================================
 app.post(
   "/bookings/create",
   requireJwtToken,
+  requireSessionHint,
   bookingRateLimiter,
   async (req, res) => {
     try {
@@ -744,12 +824,12 @@ app.post(
       }
 
       res.json(
-        encryptResponse({
+        encryptResponseForBrowser({
           success: true,
           bookingId: data.bookingId,
           message:
             "Booking logged securely. Please send receipt via Messenger.",
-        }),
+        }, req.sessionHint),
       );
     } catch (err) {
       console.error("[Booking Create Error]", err);
