@@ -21,21 +21,87 @@
 const SMOOBU_PROXY_URL = 'https://haidoville-smoobu-sync.onrender.com/availability';
 
 // ---- Helper: Decrypt an encrypted response via backend ----
-async function hvDecrypt(encryptedData) {
-  const decryptUrl = SMOOBU_PROXY_URL.replace(/\/availability$/, '/decrypt');
-  const response = await fetch(decryptUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      payload: encryptedData.payload,
-      iv: encryptedData.iv,
-      tag: encryptedData.tag,
-    }),
-  });
-  if (!response.ok) {
-    throw new Error('Decryption failed: ' + response.status);
+const BROWSER_DECRYPT_KEY = 'TtmULtv+9xsmhC2j5UNfFSCIFAE4PHDW';
+let _sessionHint = null;
+
+async function hvGetSessionHint() {
+  if (window.hvGetSessionHint) return window.hvGetSessionHint();
+  if (_sessionHint) return _sessionHint;
+  const hintUrl = SMOOBU_PROXY_URL.replace(/\/availability$/, '/api/session-hint');
+  const res = await fetch(hintUrl);
+  if (!res.ok) throw new Error('Could not get session hint (' + res.status + ').');
+  const data = await res.json();
+  if (!data.hint) throw new Error('Server did not return a session hint.');
+  _sessionHint = data.hint;
+  return _sessionHint;
+}
+
+async function hvDeriveSessionKey(hint) {
+  const rawHint    = hint.split('.')[0];
+  const passphrase = rawHint + ':' + BROWSER_DECRYPT_KEY;
+  const enc        = new TextEncoder();
+  const salt       = enc.encode('HaidoVille::AES256GCM::v1::salt::9f3a7c2e');
+
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(passphrase),
+    { name: 'PBKDF2' },
+    false,
+    ['deriveKey']
+  );
+
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: salt, iterations: 200000, hash: 'SHA-256' },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['decrypt']
+  );
+}
+
+function hexToBuffer(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
   }
-  return response.json();
+  return bytes.buffer;
+}
+
+async function hvDecrypt(encryptedData) {
+  if (window.hvDecrypt) return window.hvDecrypt(encryptedData);
+  const hint       = await hvGetSessionHint();
+  const sessionKey = await hvDeriveSessionKey(hint);
+
+  const iv         = hexToBuffer(encryptedData.iv);
+  const tag        = hexToBuffer(encryptedData.tag);
+  const ciphertext = hexToBuffer(encryptedData.payload);
+
+  const combined = new Uint8Array(ciphertext.byteLength + tag.byteLength);
+  combined.set(new Uint8Array(ciphertext), 0);
+  combined.set(new Uint8Array(tag), ciphertext.byteLength);
+
+  const plainBuf = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(iv), tagLength: 128 },
+    sessionKey,
+    combined
+  );
+  return JSON.parse(new TextDecoder().decode(plainBuf));
+}
+
+async function hvFetchWithHint(url, options) {
+  if (window.hvFetchWithHint) return window.hvFetchWithHint(url, options);
+  const hint    = await hvGetSessionHint();
+  const opts    = options ? Object.assign({}, options) : {};
+  opts.headers = Object.assign({}, opts.headers || {}, {
+    'X-Session-Hint': hint
+  });
+  const response = await fetch(url, opts);
+  if (response.status === 401) {
+    alert("Session expired, reload the page");
+    window.location.reload();
+    throw new Error("Session expired");
+  }
+  return response;
 }
 
 async function hvLoadBooked() {
@@ -50,7 +116,7 @@ async function hvLoadBooked() {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 35000);
 
-    const response = await fetch(SMOOBU_PROXY_URL, {
+    const response = await hvFetchWithHint(SMOOBU_PROXY_URL, {
       signal: controller.signal
     });
     clearTimeout(timeoutId);
