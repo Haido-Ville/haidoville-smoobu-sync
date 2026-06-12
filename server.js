@@ -15,6 +15,7 @@ import { Resend } from "resend";
 
 import path from "path";
 import { fileURLToPath } from "url";
+import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
 import {
@@ -42,9 +43,17 @@ const CREATE_SMOOBU_DRAFT = process.env.CREATE_SMOOBU_DRAFT === "true";
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
 const CALENDAR_ACCESS_TOKEN = process.env.CALENDAR_ACCESS_TOKEN;
 const JWT_SECRET = process.env.JWT_SECRET;
-const JWT_CURR_SEC = process.env.JWT_CURR_SEC || JWT_SECRET;
-const JWT_PREV_SEC = process.env.JWT_PREV_SEC || JWT_SECRET;
+let JWT_CURR_SEC = process.env.JWT_CURR_SEC || JWT_SECRET;
+let JWT_PREV_SEC = process.env.JWT_PREV_SEC || JWT_SECRET;
 const JWT_EXPIRATION = process.env.JWT_EXPIRATION || "10m";
+const JWT_ROTATE_MS = process.env.JWT_ROTATE_MS ? parseInt(process.env.JWT_ROTATE_MS, 10) : 12 * 60 * 60 * 1000;
+
+function rotateJwtKeys() {
+  JWT_PREV_SEC = JWT_CURR_SEC;
+  JWT_CURR_SEC = crypto.randomBytes(32).toString('hex');
+  console.log(`[JWT] Keys rotated at ${new Date().toISOString()}. Previous key retired, new key generated.`);
+}
+setInterval(rotateJwtKeys, JWT_ROTATE_MS);
 
 // ============================================================
 // IN-MEMORY REFERENCE NUMBER STORE (Dedup)
@@ -305,6 +314,14 @@ const tokenRateLimiter = rateLimit({
 // ============================================================
 app.get("/ping", (req, res) => {
   res.json({ ok: true, ts: Date.now() });
+});
+
+// ============================================================
+// POST /internal/rotate-jwt — Manually trigger JWT key rotation
+// ============================================================
+app.post("/internal/rotate-jwt", requireApiKey, (req, res) => {
+  rotateJwtKeys();
+  res.json({ ok: true, message: "JWT keys rotated successfully.", ts: Date.now() });
 });
 
 // ============================================================
