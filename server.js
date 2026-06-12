@@ -454,6 +454,33 @@ function cleanupSessionTokens() {
   }
 }
 
+const requireValidSessionHint = (req, res, next) => {
+  const header = req.headers["x-session-hint"] || "";
+  const parts = header.split(".");
+  if (parts.length !== 3) {
+    return res.status(400).json({ error: "Missing or malformed session hint." });
+  }
+  const [hint, ts, sig] = parts;
+  try {
+    verifyHint(hint, ts, sig);
+
+    const session = sessionTokens.get(hint);
+    if (!session) {
+      return res.status(401).json({ error: "Session expired, reload the page" });
+    }
+    if (Date.now() > session.exp) {
+      sessionTokens.delete(hint);
+      return res.status(401).json({ error: "Session expired, reload the page" });
+    }
+
+    req.sessionHint = hint;
+    next();
+  } catch (err) {
+    return res.status(403).json({ error: `Invalid session hint: ${err.message}` });
+  }
+};
+
+
 const requireSessionHint = (req, res, next) => {
   const header = req.headers["x-session-hint"] || "";
   const parts = header.split(".");
@@ -463,8 +490,7 @@ const requireSessionHint = (req, res, next) => {
   const [hint, ts, sig] = parts;
   try {
     verifyHint(hint, ts, sig);
-    
-    // Check use-limits
+
     const session = sessionTokens.get(hint);
     if (!session) {
       return res.status(401).json({ error: "Session expired, reload the page" });
@@ -509,7 +535,7 @@ app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
 // ============================================================
 // GET /availability  (public — no auth, no PII)
 // ============================================================
-app.get("/availability", requireSessionHint, async (req, res) => {
+app.get("/availability", requireValidSessionHint, async (req, res) => {
   const now = Date.now();
   if (cache.data && now - cache.timestamp < CACHE_DURATION_MS) {
     res.setHeader("X-Cache", "HIT");
