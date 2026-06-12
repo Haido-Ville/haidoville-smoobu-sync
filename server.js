@@ -313,7 +313,7 @@ app.get("/", requireApiKey, (req, res) => {
         bookingToken: "GET /booking-token (encrypted)",
         apartments: "GET /apartments-list (encrypted)",
         createBooking: "POST /bookings/create (encrypted)",
-        decrypt: "POST /decrypt",
+        decrypt: "POST /api/bootstrap/context",
       },
       timestamp: new Date().toISOString(),
     })
@@ -527,9 +527,9 @@ app.get("/booking-token", tokenRateLimiter, (req, res) => {
 });
 
 // ============================================================
-// POST /decrypt  — Frontend decryption endpoint
+// POST /api/bootstrap/context  — Frontend decryption endpoint
 // ============================================================
-app.post("/decrypt", bookingRateLimiter, handleDecrypt);
+app.post("/api/bootstrap/context", bookingRateLimiter, handleDecrypt);
 
 // ============================================================
 // POST /bookings/create
