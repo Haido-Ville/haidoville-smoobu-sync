@@ -20,20 +20,27 @@
 // Example: 'https://haidoville-smoobu-sync.onrender.com/availability'
 const SMOOBU_PROXY_URL = 'https://haidoville-smoobu-sync.onrender.com/availability';
 
-// ---- Helper: Decrypt an encrypted response via backend ----
 const BROWSER_DECRYPT_KEY = 'TtmULtv+9xsmhC2j5UNfFSCIFAE4PHDW';
-let _sessionHint = null;
+
+// ============================================================
+// GLOBAL SESSION HINT SINGLETON
+// Only ONE hint is ever fetched, shared across ALL GHL scripts
+// via window._hvSessionHintPromise. This prevents race conditions
+// where multiple scripts fetch different hints.
+// ============================================================
+if (!window._hvSessionHintPromise) {
+  window._hvSessionHintPromise = (async function() {
+    const hintUrl = SMOOBU_PROXY_URL.replace(/\/availability$/, '/api/session-hint');
+    const res = await fetch(hintUrl);
+    if (!res.ok) throw new Error('Could not get session hint (' + res.status + ').');
+    const data = await res.json();
+    if (!data.hint) throw new Error('Server did not return a session hint.');
+    return data.hint;
+  })();
+}
 
 async function hvGetSessionHint() {
-  if (window.hvGetSessionHint) return window.hvGetSessionHint();
-  if (_sessionHint) return _sessionHint;
-  const hintUrl = SMOOBU_PROXY_URL.replace(/\/availability$/, '/api/session-hint');
-  const res = await fetch(hintUrl);
-  if (!res.ok) throw new Error('Could not get session hint (' + res.status + ').');
-  const data = await res.json();
-  if (!data.hint) throw new Error('Server did not return a session hint.');
-  _sessionHint = data.hint;
-  return _sessionHint;
+  return window._hvSessionHintPromise;
 }
 
 async function hvDeriveSessionKey(hint) {
@@ -68,7 +75,6 @@ function hexToBuffer(hex) {
 }
 
 async function hvDecrypt(encryptedData) {
-  if (window.hvDecrypt) return window.hvDecrypt(encryptedData);
   const hint       = await hvGetSessionHint();
   const sessionKey = await hvDeriveSessionKey(hint);
 
@@ -89,7 +95,6 @@ async function hvDecrypt(encryptedData) {
 }
 
 async function hvFetchWithHint(url, options) {
-  if (window.hvFetchWithHint) return window.hvFetchWithHint(url, options);
   const hint    = await hvGetSessionHint();
   const opts    = options ? Object.assign({}, options) : {};
   opts.headers = Object.assign({}, opts.headers || {}, {
