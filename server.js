@@ -223,7 +223,7 @@ const requireApiKey = (req, res, next) => {
   if (!clientKey || clientKey !== INTERNAL_API_KEY) {
     return res
       .status(401)
-      .json({ error: "Unauthorized infrastructure access denied." });
+      .json({ error: "Unauthorized." });
   }
   next();
 };
@@ -231,7 +231,7 @@ const requireApiKey = (req, res, next) => {
 const requireCalendarAccess = (req, res, next) => {
   const calToken = req.headers["x-calendar-access"];
   if (!calToken || calToken !== CALENDAR_ACCESS_TOKEN) {
-    return res.status(403).json({ error: "Direct access is restricted." });
+    return res.status(403).json({ error: "Unauthorized." });
   }
   next();
 };
@@ -248,7 +248,7 @@ const requireJwtToken = (req, res, next) => {
       .status(403)
       .json({
         error:
-          "Direct access is restricted. Missing or invalid Authorization header.",
+          "Unauthorized.",
       });
   }
   const token = authHeader.split(" ")[1];
@@ -270,7 +270,7 @@ const requireJwtToken = (req, res, next) => {
   if (usedTokens.has(decoded.jti)) {
     return res
       .status(401)
-      .json({ error: "Token already used (one-time use only)." });
+      .json({ error: "Unauthorized." });
   }
   usedTokens.set(decoded.jti, decoded.exp * 1000);
   if (usedTokens.size > 1000) {
@@ -475,7 +475,7 @@ const requireValidSessionHint = (req, res, next) => {
   const header = req.headers["x-session-hint"] || "";
   const parts = header.split(".");
   if (parts.length !== 3) {
-    return res.status(400).json({ error: "Missing or malformed session hint." });
+    return res.status(400).json({ error: "Unauthorized." });
   }
   const [hint, ts, sig] = parts;
   try {
@@ -493,7 +493,7 @@ const requireValidSessionHint = (req, res, next) => {
     req.sessionHint = hint;
     next();
   } catch (err) {
-    return res.status(403).json({ error: `Invalid session hint: ${err.message}` });
+    return res.status(403).json({ error: `Invalid sh: ${err.message}` });
   }
 };
 
@@ -502,7 +502,7 @@ const requireSessionHint = (req, res, next) => {
   const header = req.headers["x-session-hint"] || "";
   const parts = header.split(".");
   if (parts.length !== 3) {
-    return res.status(400).json({ error: "Missing or malformed session hint." });
+    return res.status(400).json({ error: "Unauthorized." });
   }
   const [hint, ts, sig] = parts;
   try {
