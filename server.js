@@ -12,7 +12,7 @@
 import express from "express";
 import rateLimit from "express-rate-limit";
 import { Resend } from "resend";
-import fs from "fs";
+
 import path from "path";
 import { fileURLToPath } from "url";
 import jwt from "jsonwebtoken";
@@ -40,31 +40,20 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRATION = process.env.JWT_EXPIRATION || "10m";
 
 // ============================================================
-// PERSISTENT REFERENCE NUMBER STORE
+// IN-MEMORY REFERENCE NUMBER STORE (Dedup)
 // ============================================================
-const REFS_FILE = path.join(__dirname, "refs.json");
+const processedReferenceNumbers = new Set();
 
-function loadPersistedRefs() {
-  try {
-    if (fs.existsSync(REFS_FILE)) {
-      const raw = fs.readFileSync(REFS_FILE, "utf8");
-      const arr = JSON.parse(raw);
-      if (Array.isArray(arr)) return new Set(arr);
-    }
-  } catch (err) {
-    console.warn(
-      "[Refs] Could not load refs.json, starting fresh:",
-      err.message,
-    );
-  }
-  return new Set();
+async function isRefAlreadyUsed(refNum) {
+  return processedReferenceNumbers.has(refNum);
 }
 
-function persistRefs(set) {
-  try {
-    fs.writeFileSync(REFS_FILE, JSON.stringify([...set]), "utf8");
-  } catch (err) {
-    console.error("[Refs] Failed to persist refs.json:", err.message);
+async function markRefAsUsed(refNum) {
+  processedReferenceNumbers.add(refNum);
+  // Keep the set from growing forever - trim to last 10000
+  if (processedReferenceNumbers.size > 10000) {
+    const it = processedReferenceNumbers.values();
+    processedReferenceNumbers.delete(it.next().value);
   }
 }
 
@@ -91,60 +80,28 @@ function isHolyWeekDate(date) {
   const d = new Date(date.getFullYear(), date.getMonth(), date.getDate());
   const easter = getEaster(d.getFullYear());
   const diffDays = Math.floor((easter.getTime() - d.getTime()) / 86400000);
-  return diffDays >= -1 && diffDays <= 7;
+  return diffDays >= 0 && diffDays <= 7;
 }
 
-const processedReferenceNumbers = loadPersistedRefs();
-console.log(
-  `[Refs] Loaded ${processedReferenceNumbers.size} persisted reference number(s).`,
-);
-
-// ---- Persistent Booking ID store ----
-const BOOKING_IDS_FILE = path.join(__dirname, "booking_ids.json");
-
-function loadPersistedBookingIds() {
-  try {
-    if (fs.existsSync(BOOKING_IDS_FILE)) {
-      const raw = fs.readFileSync(BOOKING_IDS_FILE, "utf8");
-      const arr = JSON.parse(raw);
-      if (Array.isArray(arr)) return new Set(arr);
-    }
-  } catch (err) {
-    console.warn("[BookingIDs] Could not load booking_ids.json, starting fresh:", err.message);
-  }
-  return new Set();
-}
-
-function persistBookingIds(set) {
-  try {
-    const arr = [...set].slice(-10000);
-    fs.writeFileSync(BOOKING_IDS_FILE, JSON.stringify(arr), "utf8");
-  } catch (err) {
-    console.error("[BookingIDs] Failed to persist booking_ids.json:", err.message);
-  }
-}
-
-function generateUniqueBookingId() {
+// ---- Booking ID generator ----
+async function generateUniqueBookingId() {
   const now = new Date();
   const yymm =
     String(now.getFullYear()).slice(-2) +
     String(now.getMonth() + 1).padStart(2, "0");
-  let id;
-  let attempts = 0;
-  do {
-    const serial = String(Math.floor(1000 + Math.random() * 9000));
-    id = `HV-${yymm}-${serial}`;
-    attempts++;
-    if (attempts > 50) {
-      id = `HV-${yymm}-${Date.now().toString().slice(-4)}`;
-      break;
-    }
-  } while (processedBookingIds.has(id));
-  return id;
+  
+  // Use a highly unique UUID prefix to prevent collisions
+  const uniquePart = uuidv4().split('-')[0].toUpperCase();
+  return `HV-${yymm}-${uniquePart}`;
 }
 
-const processedBookingIds = loadPersistedBookingIds();
-console.log(`[BookingIDs] Loaded ${processedBookingIds.size} persisted booking ID(s).`);
+async function isBookingIdTaken(id) {
+  return false;
+}
+
+async function markBookingIdAsUsed(id) {
+  // Not needed
+}
 
 // ---- Server-Side Pricing Function ----
 function calculateRoomPrice(roomName, pax, nights, checkIn, checkOut) {
@@ -525,7 +482,7 @@ function buildAvailabilityResult(allBookings) {
     bookedRanges: [],
     bunkBookings: [],
     familyBookedUnits: [],
-    bunktotal: BUNK_APARTMENT_IDS.length,
+    bunkTotal: BUNK_APARTMENT_IDS.length,
     updatedAt: new Date().toISOString(),
     totalBookings: allBookings.length,
   };
@@ -612,7 +569,7 @@ app.post(
             .status(400)
             .json({ error: "Invalid reference tracking length." });
         }
-        if (processedReferenceNumbers.has(clientRef)) {
+        if (await isRefAlreadyUsed(clientRef)) {
           return res
             .status(409)
             .json({
@@ -657,6 +614,7 @@ app.post(
             error: 'Minimum stay is 2 nights.',
           });
         }
+        room.nights = stayNights;
       }
       
       let calculatedGrandTotal = 0;
@@ -721,8 +679,11 @@ app.post(
           ? calculatedGrandTotal
           : Math.ceil(calculatedGrandTotal * 0.5);
 
+      const serverBookingId = await generateUniqueBookingId();
+      await markBookingIdAsUsed(serverBookingId);
+
       const data = {
-        bookingId: String(rawData.bookingId).slice(0, 50),
+        bookingId: serverBookingId,
         source: String(rawData.source || "Website (Direct)").slice(0, 50),
         submittedAt: rawData.submittedAt || new Date().toISOString(),
         guest: sanitizedGuest,
@@ -738,8 +699,7 @@ app.post(
       };
 
       if (paymentChannel !== "cash") {
-        processedReferenceNumbers.add(clientRef);
-        persistRefs(processedReferenceNumbers);
+        await markRefAsUsed(clientRef);
       }
 
       pendingBookings.push({ ...data, receivedAt: new Date().toISOString() });
