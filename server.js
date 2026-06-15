@@ -202,6 +202,7 @@ app.use((req, res, next) => {
   const origin = req.headers.origin || "";
   const allowedOrigins = [
     "https://haidoville.com",
+    "https://app.haidoville.com/",
     "https://www.haidoville.com",
   ];
   if (allowedOrigins.includes(origin)) {
@@ -717,13 +718,21 @@ app.post(
         ),
       };
 
+      const VALID_ROOM_NAMES = Object.keys(ROOM_NAME_TO_APT_ID); // ["Barkada Room","Couple Room","Family Room 1","Family Room 2","Bunk Beds"]
+
+      for (const room of rawData.rooms) {
+        if (!VALID_ROOM_NAMES.includes(String(room.name))) {
+          return res.status(400).json({ error: "Invalid room name." });
+        }
+      }
+
       const sanitizedRooms = rawData.rooms.map((room) => ({
         name: String(room.name),
         checkIn: String(room.checkIn).slice(0, 10),
         checkOut: String(room.checkOut).slice(0, 10),
         nights: Math.max(1, Math.min(30, parseInt(room.nights) || 1)),
         pax: Math.max(1, Math.min(9, parseInt(room.pax) || 1)),
-        paxLabel: String(room.paxLabel || "Guests"),
+        paxLabel: room.name === "Bunk Beds" ? "Beds" : "Guests", // derive server-side, never trust client
       }));
 
       for (const room of sanitizedRooms) {
@@ -1131,9 +1140,9 @@ async function sendBookingEmail(data) {
       (r, i) => `
     <tr>
       <td style="padding:8px 0;border-bottom:1px solid #eee;">
-        <strong>Room ${i + 1}: ${r.name}</strong><br>
-        <small style="color:#666;">${r.checkIn} → ${r.checkOut} (${r.nights} nights)</small><br>
-        <small style="color:#666;">${r.pax} ${r.paxLabel} • ₱${r.subtotal.toLocaleString()}</small>
+        <strong>Room ${i + 1}: ${esc(r.name)}</strong><br>
+        <small style="color:#666;">${esc(r.checkIn)} → ${esc(r.checkOut)} (${r.nights} nights)</small><br>
+        <small style="color:#666;">${r.pax} ${esc(r.paxLabel)} • ₱${r.subtotal.toLocaleString()}</small>
       </td>
     </tr>
   `,
@@ -1144,8 +1153,8 @@ async function sendBookingEmail(data) {
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#1a1a1a;">
       <div style="background:linear-gradient(135deg,#C9A96E 0%,#b8935a 100%);color:#fff;padding:20px;border-radius:12px 12px 0 0;">
         <h2 style="margin:0;font-size:22px;">🏠 Secure HaidoVille Booking</h2>
-        <p style="margin:6px 0 0;opacity:0.9;">Reference Code Verified: ${data.bookingId}</p>
-        <p style="margin:4px 0 0;opacity:0.8;font-size:13px;">Source: ${data.source || "Website (Direct)"}</p>
+        <p style="margin:6px 0 0;opacity:0.9;">Reference Code Verified: ${esc(data.bookingId)}</p>
+        <p style="margin:4px 0 0;opacity:0.8;font-size:13px;">Source: ${esc(data.source || "Website (Direct)")}</p>
       </div>
       <div style="background:#f9f9f9;padding:20px;border-radius:0 0 12px 12px;">
         <h3 style="margin-top:0;color:#C9A96E;">👤 Guest Details</h3>
@@ -1172,11 +1181,12 @@ async function sendBookingEmail(data) {
     </div>
   `;
 
+  const safeSubjectName = String(data.guest.name).replace(/[\r\n]/g, " ").slice(0, 80);
   await resend.emails.send({
     from: `HaidoVille Booking <${FROM_EMAIL}>`,
     to: ADMIN_EMAIL,
     replyTo: data.guest.email,
-    subject: `🏠 Verified Booking: ${data.bookingId} — ${data.guest.name}${isCash ? " [WALK-IN/CASH]" : ""}`,
+    subject: `🏠 Verified Booking: ${data.bookingId} — ${safeSubjectName}${isCash ? " [WALK-IN/CASH]" : ""}`,
     html,
   });
 
