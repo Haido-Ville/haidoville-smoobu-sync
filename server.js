@@ -14,13 +14,13 @@ import rateLimit from "express-rate-limit";
 import { Resend } from "resend";
 
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
 import {
   encryptResponse,
-  encryptResponseForBrowser,
   generateHint,
   verifyHint,
 } from "./encryption.js";
@@ -56,9 +56,23 @@ function rotateJwtKeys() {
 setInterval(rotateJwtKeys, JWT_ROTATE_MS);
 
 // ============================================================
-// IN-MEMORY REFERENCE NUMBER STORE (Dedup)
 // ============================================================
-const processedReferenceNumbers = new Set();
+// PERSISTENT REFERENCE NUMBER STORE (Dedup)
+// ============================================================
+const REF_FILE = path.join(__dirname, "data", "processed_refs.json");
+let processedReferenceNumbers = new Set();
+
+try {
+  if (fs.existsSync(REF_FILE)) {
+    const data = JSON.parse(fs.readFileSync(REF_FILE, "utf8"));
+    processedReferenceNumbers = new Set(data);
+  } else {
+    fs.mkdirSync(path.join(__dirname, "data"), { recursive: true });
+    fs.writeFileSync(REF_FILE, JSON.stringify([]));
+  }
+} catch (e) {
+  console.error("Error loading reference numbers:", e.message);
+}
 
 async function isRefAlreadyUsed(refNum) {
   return processedReferenceNumbers.has(refNum);
@@ -66,10 +80,14 @@ async function isRefAlreadyUsed(refNum) {
 
 async function markRefAsUsed(refNum) {
   processedReferenceNumbers.add(refNum);
-  // Keep the set from growing forever - trim to last 10000
   if (processedReferenceNumbers.size > 10000) {
     const it = processedReferenceNumbers.values();
     processedReferenceNumbers.delete(it.next().value);
+  }
+  try {
+    fs.writeFileSync(REF_FILE, JSON.stringify([...processedReferenceNumbers]));
+  } catch(e) {
+    console.error("Error saving reference numbers:", e.message);
   }
 }
 
@@ -111,13 +129,7 @@ async function generateUniqueBookingId() {
   return `HV-${yymm}-${uniquePart}`;
 }
 
-async function isBookingIdTaken(id) {
-  return false;
-}
 
-async function markBookingIdAsUsed(id) {
-  // Not needed
-}
 
 // ---- Server-Side Pricing Function ----
 function calculateRoomPrice(roomName, pax, nights, checkIn, checkOut) {
@@ -210,7 +222,7 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader(
       "Access-Control-Allow-Headers",
-      "Content-Type, X-API-Key, X-Calendar-Access, Authorization, X-Session-Hint"
+      "Content-Type, X-API-Key, X-Calendar-Access, Authorization, X-Session-Hint, X-Timestamp"
     );
   } else {
     res.setHeader("Access-Control-Allow-Origin", "https://haidoville.com");
@@ -233,6 +245,29 @@ const requireCalendarAccess = (req, res, next) => {
   const calToken = req.headers["x-calendar-access"];
   if (!calToken || calToken !== CALENDAR_ACCESS_TOKEN) {
     return res.status(403).json({ error: "Unauthorized." });
+  }
+  next();
+};
+
+// ============================================================
+// TIMESTAMP DRIFT MIDDLEWARE (Vuln D — Replay Attack Prevention)
+// Rejects requests whose X-Timestamp header is older than 5 minutes
+// or missing on state-changing endpoints.
+// ============================================================
+const MAX_TIMESTAMP_DRIFT_MS = 5 * 60 * 1000; // 5 minutes
+
+const requireFreshTimestamp = (req, res, next) => {
+  const raw = req.headers["x-timestamp"];
+  if (!raw) {
+    return res.status(400).json({ error: "Missing X-Timestamp header." });
+  }
+  const incoming = parseInt(raw, 10);
+  if (isNaN(incoming)) {
+    return res.status(400).json({ error: "Invalid X-Timestamp header." });
+  }
+  const drift = Math.abs(Date.now() - incoming);
+  if (drift > MAX_TIMESTAMP_DRIFT_MS) {
+    return res.status(400).json({ error: "Request timestamp expired. Possible replay detected." });
   }
   next();
 };
@@ -347,8 +382,7 @@ app.get("/", requireApiKey, (req, res) => {
         bookings: "GET /bookings (encrypted)",
         bookingToken: "GET /booking-token (encrypted)",
         apartments: "GET /apartments-list (encrypted)",
-        createBooking: "POST /bookings/create (encrypted)",
-        decrypt: "POST /api/bootstrap/context",
+        createBooking: "POST /bookings/create",
       },
       timestamp: new Date().toISOString(),
     })
@@ -537,6 +571,20 @@ const requireSessionHint = (req, res, next) => {
 // GET /api/session-hint  — Issues a signed hint per page-load
 // ============================================================
 app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
+  const origin = req.headers.origin || req.headers.referer;
+  const allowedOrigins = [
+    "https://haidoville.com",
+    "https://app.haidoville.com",
+    "https://www.haidoville.com",
+    "http://127.0.0.1",
+    "http://localhost"
+  ];
+  
+  const isAllowed = allowedOrigins.some(allowed => origin && origin.startsWith(allowed));
+  if (!isAllowed) {
+    return res.status(403).json({ error: "Unauthorized." });
+  }
+
   try {
     const { hint, ts, sig } = generateHint();
     sessionTokens.set(hint, {
@@ -551,6 +599,20 @@ app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
 });
 
 // ============================================================
+// GET /api/payment-methods  — Serves payment data
+// ============================================================
+app.get("/api/payment-methods", tokenRateLimiter, requireValidSessionHint, (req, res) => {
+  res.json({
+    payments: {
+      gcash: { number: "0977-395-5742", owner: "Arturo Valler" },
+      maya: { number: "0977-395-5742", owner: "Arturo Valler" },
+      metrobank: { account: "4773-9043-68947", owner: "Jenalyn M. Valler" },
+      landbank: { account: "1096-1263-16", owner: "Jenalyn M. Valler" }
+    }
+  });
+});
+
+// ============================================================
 // GET /availability  (public — no auth, no PII)
 // ============================================================
 app.get("/availability", requireValidSessionHint, async (req, res) => {
@@ -558,7 +620,7 @@ app.get("/availability", requireValidSessionHint, async (req, res) => {
   if (cache.data && now - cache.timestamp < CACHE_DURATION_MS) {
     res.setHeader("X-Cache", "HIT");
     res.setHeader("X-Cache-Age", Math.floor((now - cache.timestamp) / 1000));
-    return res.json(encryptResponseForBrowser(cache.data, req.sessionHint));
+    return res.json(cache.data);
   }
 
   if (!SMOOBU_API_KEY)
@@ -597,7 +659,7 @@ app.get("/availability", requireValidSessionHint, async (req, res) => {
     const result = buildAvailabilityResult(allBookings);
     cache = { data: result, timestamp: now };
     res.setHeader("X-Cache", "MISS");
-    res.json(encryptResponseForBrowser(result, req.sessionHint));
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: "Server error", message: err.message });
   }
@@ -651,7 +713,7 @@ app.get("/booking-token", tokenRateLimiter, requireSessionHint, (req, res) => {
   const jti = uuidv4();
   // Sign new tokens with the current rotating key
   const token = jwt.sign({ jti }, JWT_CURR_SEC, { expiresIn: JWT_EXPIRATION });
-  res.json(encryptResponseForBrowser({ token }, req.sessionHint));
+  res.json({ token });
 });
 
 
@@ -661,6 +723,7 @@ app.post(
   "/bookings/create",
   requireJwtToken,
   requireSessionHint,
+  requireFreshTimestamp,
   bookingRateLimiter,
   async (req, res) => {
     try {
@@ -811,8 +874,15 @@ app.post(
           ? calculatedGrandTotal
           : Math.ceil(calculatedGrandTotal * 0.5);
 
+      // --- Security Validation: Prevent Price Manipulation ---
+      const clientAmount = Number(rawData.payment.amount);
+      const clientGrandTotal = Number(rawData.payment.grandTotal);
+      if (Math.abs(clientAmount - finalAmountPaid) > 1 || Math.abs(clientGrandTotal - calculatedGrandTotal) > 1) {
+        return res.status(400).json({ error: "Price mismatch detected. Please refresh and try again." });
+      }
+
       const serverBookingId = await generateUniqueBookingId();
-      await markBookingIdAsUsed(serverBookingId);
+
 
       const data = {
         bookingId: serverBookingId,
@@ -875,14 +945,14 @@ app.post(
           .catch((err) => console.error("[Smoobu Draft Error]", err.message));
       }
 
-      res.json(
-        encryptResponseForBrowser({
+      res.json({
           success: true,
           bookingId: data.bookingId,
           message:
-            "Booking logged securely. Please send receipt via Messenger.",
-        }, req.sessionHint),
-      );
+            paymentChannel === "cash"
+              ? "Booking confirmed! Please pay in cash upon arrival."
+              : "Booking reserved. Please complete payment.",
+        });
     } catch (err) {
       console.error("[Booking Create Error]", err);
       res.status(500).json({ error: "Server error", message: err.message });
