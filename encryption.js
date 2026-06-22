@@ -43,7 +43,7 @@ const PBKDF2_DIGEST    = "sha512";
 
 // Fixed salt — public, prevents rainbow tables.
 const PBKDF2_SALT = Buffer.from(
-  "HaidoVille::AES256GCM::v1::salt::9f3a7c2e",
+  process.env.PBKDF2_SALT || "HaidoVille::AES256GCM::v1::salt::9f3a7c2e",
   "utf8",
 );
 
@@ -59,16 +59,7 @@ function getMasterKey() {
   return _masterKey;
 }
 
-// ─── Session key (derived per page-load hint, used for browser responses) ─────
-// hint  : 16-byte hex nonce issued by /api/session-hint
-// Returns a 32-byte Buffer — same derivation the browser does via Web Crypto.
-function getSessionKey(hint) {
-  const browserDecryptKey = process.env.BROWSER_DECRYPT_KEY;
-  if (!browserDecryptKey) throw new Error("[Encryption] BROWSER_DECRYPT_KEY env var not set.");
-  const passphrase = `${hint}:${browserDecryptKey}`;
-  // Use the SAME iteration count the browser uses (200k) so keys match.
-  return crypto.pbkdf2Sync(passphrase, PBKDF2_SALT, PBKDF2_ITERATIONS_CLIENT, KEY_LENGTH, "sha256");
-}
+// Removed getSessionKey as browser encryption is deprecated.
 
 // ─── Hint token helpers ────────────────────────────────────────────────────────
 const HINT_TTL_MS = 15 * 60 * 1000; // 15-minute window
@@ -131,11 +122,6 @@ export function encryptResponse(data) {
   return { _encrypted: true, payload: encrypted, iv, tag };
 }
 
-// Encrypt with session key derived from the page-load hint.
-export function encryptResponseForBrowser(data, hint) {
-  const sessionKey = getSessionKey(hint);
-  const { encrypted, iv, tag } = encrypt(data, sessionKey);
-  return { _encrypted: true, _session: true, payload: encrypted, iv, tag };
-}
+
 
 
