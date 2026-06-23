@@ -524,6 +524,12 @@ const requireValidSessionHint = (req, res, next) => {
       sessionTokens.delete(hint);
       return res.status(401).json({ error: "Session expired, reload the page" });
     }
+    const currentIp = req.ip || req.connection?.remoteAddress || "unknown";
+    const currentUa = req.headers["user-agent"] || "unknown";
+    if (session.ip !== currentIp || session.userAgent !== currentUa) {
+      sessionTokens.delete(hint);
+      return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
+    }
 
     req.sessionHint = hint;
     next();
@@ -550,6 +556,12 @@ const requireSessionHint = (req, res, next) => {
     if (Date.now() > session.exp) {
       sessionTokens.delete(hint);
       return res.status(401).json({ error: "Session expired, reload the page" });
+    }
+    const currentIp = req.ip || req.connection?.remoteAddress || "unknown";
+    const currentUa = req.headers["user-agent"] || "unknown";
+    if (session.ip !== currentIp || session.userAgent !== currentUa) {
+      sessionTokens.delete(hint);
+      return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
     }
     if (session.usesLeft <= 0) {
       sessionTokens.delete(hint);
@@ -590,6 +602,8 @@ app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
     sessionTokens.set(hint, {
       usesLeft: SESSION_MAX_USES,
       exp: Date.now() + SESSION_TTL_MS,
+      ip: req.ip || req.connection?.remoteAddress || "unknown",
+      userAgent: req.headers["user-agent"] || "unknown"
     });
     res.json({ hint: `${hint}.${ts}.${sig}` });
   } catch (err) {
@@ -765,20 +779,19 @@ app.post(
         }
       }
 
+      const sanitizeText = (str, maxLen) => String(str || "").replace(/[<>]/g, "").trim().slice(0, maxLen);
+
       const sanitizedGuest = {
-        name: String(rawData.guest.name || "").slice(0, 80),
-        email: String(rawData.guest.email || "").slice(0, 80),
-        phone: String(rawData.guest.phone || "").slice(0, 30),
-        age: String(rawData.guest.age || ""),
-        nationality: String(rawData.guest.nationality || "").slice(0, 30),
-        address: String(rawData.guest.address || "").slice(0, 200),
-        arrivalTime: String(rawData.guest.arrivalTime || ""),
-        departureTime: String(rawData.guest.departureTime || ""),
-        port: String(rawData.guest.port || "").slice(0, 50),
-        specialRequest: String(rawData.guest.specialRequest || "").slice(
-          0,
-          500,
-        ),
+        name: sanitizeText(rawData.guest.name, 80),
+        email: sanitizeText(rawData.guest.email, 80),
+        phone: sanitizeText(rawData.guest.phone, 30),
+        age: sanitizeText(rawData.guest.age, 10),
+        nationality: sanitizeText(rawData.guest.nationality, 30),
+        address: sanitizeText(rawData.guest.address, 200),
+        arrivalTime: sanitizeText(rawData.guest.arrivalTime, 20),
+        departureTime: sanitizeText(rawData.guest.departureTime, 20),
+        port: sanitizeText(rawData.guest.port, 50),
+        specialRequest: sanitizeText(rawData.guest.specialRequest, 500),
       };
 
       const VALID_ROOM_NAMES = Object.keys(ROOM_NAME_TO_APT_ID); // ["Barkada Room","Couple Room","Family Room 1","Family Room 2","Bunk Beds"]
