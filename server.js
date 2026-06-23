@@ -236,7 +236,7 @@ const requireApiKey = (req, res, next) => {
   if (!clientKey || clientKey !== INTERNAL_API_KEY) {
     return res
       .status(401)
-      .json({ error: "Unauthorized." });
+      .json({ error: "Unauthorized" });
   }
   next();
 };
@@ -244,7 +244,7 @@ const requireApiKey = (req, res, next) => {
 const requireCalendarAccess = (req, res, next) => {
   const calToken = req.headers["x-calendar-access"];
   if (!calToken || calToken !== CALENDAR_ACCESS_TOKEN) {
-    return res.status(403).json({ error: "Unauthorized." });
+    return res.status(403).json({ error: "Unauthorized" });
   }
   next();
 };
@@ -284,7 +284,7 @@ const requireJwtToken = (req, res, next) => {
       .status(403)
       .json({
         error:
-          "Unauthorized.",
+          "Unauthorized",
       });
   }
   const token = authHeader.split(" ")[1];
@@ -306,7 +306,7 @@ const requireJwtToken = (req, res, next) => {
   if (usedTokens.has(decoded.jti)) {
     return res
       .status(401)
-      .json({ error: "Unauthorized." });
+      .json({ error: "Unauthorized" });
   }
   usedTokens.set(decoded.jti, decoded.exp * 1000);
   if (usedTokens.size > 1000) {
@@ -510,7 +510,7 @@ const requireValidSessionHint = (req, res, next) => {
   const header = req.headers["x-session-hint"] || "";
   const parts = header.split(".");
   if (parts.length !== 3) {
-    return res.status(400).json({ error: "Unauthorized." });
+    return res.status(400).json({ error: "Unauthorized" });
   }
   const [hint, ts, sig] = parts;
   try {
@@ -524,12 +524,11 @@ const requireValidSessionHint = (req, res, next) => {
       sessionTokens.delete(hint);
       return res.status(401).json({ error: "Session expired, reload the page" });
     }
-    // const currentIp = req.ip || req.connection?.remoteAddress || "unknown";
-    // const currentUa = req.headers["user-agent"] || "unknown";
-    // if (session.ip !== currentIp || session.userAgent !== currentUa) {
-    //   sessionTokens.delete(hint);
-    //   return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
-    // }
+    const currentUa = req.headers["user-agent"] || "unknown";
+    if (session.userAgent !== currentUa) {
+      sessionTokens.delete(hint);
+      return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
+    }
 
     req.sessionHint = hint;
     next();
@@ -543,7 +542,7 @@ const requireSessionHint = (req, res, next) => {
   const header = req.headers["x-session-hint"] || "";
   const parts = header.split(".");
   if (parts.length !== 3) {
-    return res.status(400).json({ error: "Unauthorized." });
+    return res.status(400).json({ error: "Unauthorized" });
   }
   const [hint, ts, sig] = parts;
   try {
@@ -557,12 +556,11 @@ const requireSessionHint = (req, res, next) => {
       sessionTokens.delete(hint);
       return res.status(401).json({ error: "Session expired, reload the page" });
     }
-    // const currentIp = req.ip || req.connection?.remoteAddress || "unknown";
-    // const currentUa = req.headers["user-agent"] || "unknown";
-    // if (session.ip !== currentIp || session.userAgent !== currentUa) {
-    //   sessionTokens.delete(hint);
-    //   return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
-    // }
+    const currentUa = req.headers["user-agent"] || "unknown";
+    if (session.userAgent !== currentUa) {
+      sessionTokens.delete(hint);
+      return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
+    }
     if (session.usesLeft <= 0) {
       sessionTokens.delete(hint);
       return res.status(401).json({ error: "Session expired, reload the page" });
@@ -594,7 +592,7 @@ app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
   
   const isAllowed = allowedOrigins.some(allowed => origin && origin.startsWith(allowed));
   if (!isAllowed) {
-    return res.status(403).json({ error: "Unauthorized." });
+    return res.status(403).json({ error: "Unauthorized" });
   }
 
   try {
@@ -602,8 +600,7 @@ app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
     sessionTokens.set(hint, {
       usesLeft: SESSION_MAX_USES,
       exp: Date.now() + SESSION_TTL_MS,
-      // ip: req.ip || req.connection?.remoteAddress || "unknown",
-      // userAgent: req.headers["user-agent"] || "unknown"
+      userAgent: req.headers["user-agent"] || "unknown"
     });
     res.json({ hint: `${hint}.${ts}.${sig}` });
   } catch (err) {
