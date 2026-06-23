@@ -259,15 +259,15 @@ const MAX_TIMESTAMP_DRIFT_MS = 5 * 60 * 1000; // 5 minutes
 const requireFreshTimestamp = (req, res, next) => {
   const raw = req.headers["x-timestamp"];
   if (!raw) {
-    return res.status(400).json({ error: "Missing X-Timestamp header." });
+    return res.status(400).json({ error: "Unauthorized" });
   }
   const incoming = parseInt(raw, 10);
   if (isNaN(incoming)) {
-    return res.status(400).json({ error: "Invalid X-Timestamp header." });
+    return res.status(400).json({ error: "Unauthorized" });
   }
   const drift = Math.abs(Date.now() - incoming);
   if (drift > MAX_TIMESTAMP_DRIFT_MS) {
-    return res.status(400).json({ error: "Request timestamp expired. Possible replay detected." });
+    return res.status(400).json({ error: "Unauthorized" });
   }
   next();
 };
@@ -528,7 +528,7 @@ const requireValidSessionHint = (req, res, next) => {
     req.sessionHint = hint;
     next();
   } catch (err) {
-    return res.status(403).json({ error: `Invalid sh: ${err.message}` });
+    return res.status(403).json({ error: "Ewan" });
   }
 };
 
@@ -563,7 +563,7 @@ const requireSessionHint = (req, res, next) => {
     req.sessionHint = hint;
     next();
   } catch (err) {
-    return res.status(403).json({ error: `Invalid session hint: ${err.message}` });
+    return res.status(403).json({ error: "Ewan" });
   }
 };
 
@@ -661,7 +661,7 @@ app.get("/availability", requireValidSessionHint, async (req, res) => {
     res.setHeader("X-Cache", "MISS");
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: "Server error", message: err.message });
+    res.status(500).json({ error: "Server error" });
   }
 });
 
@@ -754,13 +754,13 @@ app.post(
         if (!clientRef || clientRef.length < 5) {
           return res
             .status(400)
-            .json({ error: "Invalid reference tracking length." });
+            .json({ error: "Unauthorized" });
         }
         if (await isRefAlreadyUsed(clientRef)) {
           return res
             .status(409)
             .json({
-              error: "Duplicate transaction reference code tracking conflict.",
+              error: "Unauthorized",
             });
         }
       }
@@ -864,7 +864,7 @@ app.post(
       const VALID_CHANNELS = ["gcash","maya","metro","land","cash"];
       const paymentChannel = String(rawData.payment.channel);
       if (!VALID_CHANNELS.includes(paymentChannel)) {
-        return res.status(400).json({ error: "Invalid payment channel." });
+        return res.status(400).json({ error: "Unauthorized" });
       }
 
       const paymentType =
@@ -878,7 +878,7 @@ app.post(
       const clientAmount = Number(rawData.payment.amount);
       const clientGrandTotal = Number(rawData.payment.grandTotal);
       if (Math.abs(clientAmount - finalAmountPaid) > 1 || Math.abs(clientGrandTotal - calculatedGrandTotal) > 1) {
-        return res.status(400).json({ error: "Price mismatch detected. Please refresh and try again." });
+        return res.status(400).json({ error: "Unauthorized" });
       }
 
       const serverBookingId = await generateUniqueBookingId();
@@ -955,7 +955,7 @@ app.post(
         });
     } catch (err) {
       console.error("[Booking Create Error]", err);
-      res.status(500).json({ error: "Server error", message: err.message });
+      res.status(500).json({ error: "Server error"  });
     }
   },
 );
