@@ -237,7 +237,6 @@ if (!clientKey || clientKey !== INTERNAL_API_KEY) {
 return res
 .status(401)
       .json({ error: "Unauthorized." });
-      .json({ error: "Unauthorized" });
 }
 next();
 };
@@ -246,7 +245,6 @@ const requireCalendarAccess = (req, res, next) => {
 const calToken = req.headers["x-calendar-access"];
 if (!calToken || calToken !== CALENDAR_ACCESS_TOKEN) {
     return res.status(403).json({ error: "Unauthorized." });
-    return res.status(403).json({ error: "Unauthorized" });
 }
 next();
 };
@@ -287,7 +285,6 @@ return res
 .json({
 error:
           "Unauthorized.",
-          "Unauthorized",
 });
 }
 const token = authHeader.split(" ")[1];
@@ -310,7 +307,6 @@ if (usedTokens.has(decoded.jti)) {
 return res
 .status(401)
       .json({ error: "Unauthorized." });
-      .json({ error: "Unauthorized" });
 }
 usedTokens.set(decoded.jti, decoded.exp * 1000);
 if (usedTokens.size > 1000) {
@@ -515,7 +511,6 @@ const header = req.headers["x-session-hint"] || "";
 const parts = header.split(".");
 if (parts.length !== 3) {
     return res.status(400).json({ error: "Unauthorized." });
-    return res.status(400).json({ error: "Unauthorized" });
 }
 const [hint, ts, sig] = parts;
 try {
@@ -554,7 +549,6 @@ const header = req.headers["x-session-hint"] || "";
 const parts = header.split(".");
 if (parts.length !== 3) {
     return res.status(400).json({ error: "Unauthorized." });
-    return res.status(400).json({ error: "Unauthorized" });
 }
 const [hint, ts, sig] = parts;
 try {
@@ -611,7 +605,6 @@ const allowedOrigins = [
 const isAllowed = allowedOrigins.some(allowed => origin && origin.startsWith(allowed));
 if (!isAllowed) {
     return res.status(403).json({ error: "Unauthorized." });
-    return res.status(403).json({ error: "Unauthorized" });
 }
 
 try {
