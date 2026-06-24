@@ -21,6 +21,7 @@ import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
 import {
   encryptResponse,
+  encryptForSession,
   generateHint,
   verifyHint,
 } from "./encryption.js";
@@ -434,7 +435,7 @@ app.get("/bookings", requireCalendarAccess, async (req, res) => {
   if (!nocache && cache.data && now - cache.timestamp < CACHE_DURATION_MS) {
     res.setHeader("X-Cache", "HIT");
     res.setHeader("X-Cache-Age", Math.floor((now - cache.timestamp) / 1000));
-    return res.json(encryptResponse(cache.data));
+    return res.json(encryptForSession(cache.data, req.headers["x-session-hint"] || ""));
   }
 
   try {
@@ -724,7 +725,7 @@ app.get("/booking-token", tokenRateLimiter, requireSessionHint, (req, res) => {
   const jti = uuidv4();
   // Sign new tokens with the current rotating key
   const token = jwt.sign({ jti }, JWT_CURR_SEC, { expiresIn: JWT_EXPIRATION });
-  res.json(encryptResponse({ token }));
+  res.json(encryptForSession({ token }, req.headers["x-session-hint"] || ""));
 });
 
 
@@ -965,14 +966,14 @@ let bookingMutex = Promise.resolve();
           .catch((err) => console.error("[Smoobu Draft Error]", err.message));
       }
 
-      res.json({
+      res.json(encryptForSession({
           success: true,
           bookingId: data.bookingId,
           message:
             paymentChannel === "cash"
               ? "Booking confirmed! Please pay in cash upon arrival."
               : "Booking reserved. Please complete payment.",
-        });
+        }, req.headers["x-session-hint"] || ""));
     } catch (err) {
       console.error("[Booking Create Error]", err);
       res.status(500).json({ error: "Server error"  });
