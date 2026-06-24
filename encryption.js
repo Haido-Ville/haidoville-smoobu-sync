@@ -125,3 +125,24 @@ export function encryptResponse(data) {
 
 
 
+
+
+export function getSessionKey(hint) {
+  const browserKey = process.env.BROWSER_DECRYPT_KEY;
+  if (!browserKey) throw new Error("[Encryption] BROWSER_DECRYPT_KEY env var not set.");
+  const rawHint = hint.split('.')[0];
+  const passphrase = rawHint + ':' + browserKey;
+  return crypto.pbkdf2Sync(
+    passphrase,
+    PBKDF2_SALT,
+    PBKDF2_ITERATIONS_CLIENT,
+    KEY_LENGTH,
+    "sha256"
+  );
+}
+
+export function encryptForSession(data, hint) {
+  const key = getSessionKey(hint);
+  const { encrypted, iv, tag } = encrypt(data, key);
+  return { _encrypted: true, payload: encrypted, iv, tag };
+}
