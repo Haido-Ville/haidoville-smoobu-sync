@@ -214,7 +214,7 @@ app.use((req, res, next) => {
   const origin = req.headers.origin || "";
   const allowedOrigins = [
     "https://haidoville.com",
-    "https://app.haidoville.com/",
+    "https://app.haidoville.com",
     "https://www.haidoville.com",
   ];
   if (allowedOrigins.includes(origin)) {
@@ -631,7 +631,7 @@ app.get("/availability", requireValidSessionHint, async (req, res) => {
   if (cache.data && now - cache.timestamp < CACHE_DURATION_MS) {
     res.setHeader("X-Cache", "HIT");
     res.setHeader("X-Cache-Age", Math.floor((now - cache.timestamp) / 1000));
-    return res.json(cache.data);
+    return res.json(encryptResponse(cache.data));
   }
 
   if (!SMOOBU_API_KEY)
@@ -670,7 +670,7 @@ app.get("/availability", requireValidSessionHint, async (req, res) => {
     const result = buildAvailabilityResult(allBookings);
     cache = { data: result, timestamp: now };
     res.setHeader("X-Cache", "MISS");
-    res.json(result);
+    res.json(encryptResponse(result));
   } catch (err) {
     res.status(500).json({ error: "Server error" });
   }
@@ -724,19 +724,25 @@ app.get("/booking-token", tokenRateLimiter, requireSessionHint, (req, res) => {
   const jti = uuidv4();
   // Sign new tokens with the current rotating key
   const token = jwt.sign({ jti }, JWT_CURR_SEC, { expiresIn: JWT_EXPIRATION });
-  res.json({ token });
+  res.json(encryptResponse({ token }));
 });
 
 
 
 // ============================================================
-app.post(
-  "/bookings/create",
+let bookingMutex = Promise.resolve();
+  app.post(
+    "/bookings/create",
   requireJwtToken,
   requireSessionHint,
   requireFreshTimestamp,
   bookingRateLimiter,
   async (req, res) => {
+    let releaseMutex;
+    const acquired = new Promise(r => releaseMutex = r);
+    const prev = bookingMutex;
+    bookingMutex = acquired;
+    await prev;
     try {
       const rawData = req.body;
 
@@ -790,6 +796,10 @@ app.post(
         port: sanitizeText(rawData.guest.port, 50),
         specialRequest: sanitizeText(rawData.guest.specialRequest, 500),
       };
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(sanitizedGuest.email)) {
+        return res.status(400).json({ error: "Invalid email address." });
+      }
+
 
       const VALID_ROOM_NAMES = Object.keys(ROOM_NAME_TO_APT_ID); // ["Barkada Room","Couple Room","Family Room 1","Family Room 2","Bunk Beds"]
 
@@ -966,6 +976,8 @@ app.post(
     } catch (err) {
       console.error("[Booking Create Error]", err);
       res.status(500).json({ error: "Server error"  });
+    } finally {
+      releaseMutex();
     }
   },
 );
