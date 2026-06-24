@@ -259,18 +259,15 @@ const MAX_TIMESTAMP_DRIFT_MS = 5 * 60 * 1000; // 5 minutes
 const requireFreshTimestamp = (req, res, next) => {
 const raw = req.headers["x-timestamp"];
 if (!raw) {
-    return res.status(400).json({ error: "Missing X-Timestamp header." });
-    return res.status(400).json({ error: "Unauthorized" });
+return res.status(400).json({ error: "Unauthorized" });
 }
 const incoming = parseInt(raw, 10);
 if (isNaN(incoming)) {
-    return res.status(400).json({ error: "Invalid X-Timestamp header." });
-    return res.status(400).json({ error: "Unauthorized" });
+return res.status(400).json({ error: "Unauthorized" });
 }
 const drift = Math.abs(Date.now() - incoming);
 if (drift > MAX_TIMESTAMP_DRIFT_MS) {
-    return res.status(400).json({ error: "Request timestamp expired. Possible replay detected." });
-    return res.status(400).json({ error: "Unauthorized" });
+return res.status(400).json({ error: "Unauthorized" });
 }
 next();
 };
@@ -527,12 +524,23 @@ if (Date.now() > session.exp) {
 sessionTokens.delete(hint);
 return res.status(401).json({ error: "Session expired, reload the page" });
 }
+    const currentIp = req.ip || req.connection?.remoteAddress || "unknown";
+    const currentUa = req.headers["user-agent"] || "unknown";
+    if (session.ip !== currentIp || session.userAgent !== currentUa) {
+      sessionTokens.delete(hint);
+      return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
+    }
+    // const currentIp = req.ip || req.connection?.remoteAddress || "unknown";
+    // const currentUa = req.headers["user-agent"] || "unknown";
+    // if (session.ip !== currentIp || session.userAgent !== currentUa) {
+    //   sessionTokens.delete(hint);
+    //   return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
+    // }
 
 req.sessionHint = hint;
 next();
 } catch (err) {
-    return res.status(403).json({ error: `Invalid sh: ${err.message}` });
-    return res.status(403).json({ error: "Ewan" });
+return res.status(403).json({ error: "Ewan" });
 }
 };
 
@@ -555,6 +563,18 @@ if (Date.now() > session.exp) {
 sessionTokens.delete(hint);
 return res.status(401).json({ error: "Session expired, reload the page" });
 }
+    const currentIp = req.ip || req.connection?.remoteAddress || "unknown";
+    const currentUa = req.headers["user-agent"] || "unknown";
+    if (session.ip !== currentIp || session.userAgent !== currentUa) {
+      sessionTokens.delete(hint);
+      return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
+    }
+    // const currentIp = req.ip || req.connection?.remoteAddress || "unknown";
+    // const currentUa = req.headers["user-agent"] || "unknown";
+    // if (session.ip !== currentIp || session.userAgent !== currentUa) {
+    //   sessionTokens.delete(hint);
+    //   return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
+    // }
 if (session.usesLeft <= 0) {
 sessionTokens.delete(hint);
 return res.status(401).json({ error: "Session expired, reload the page" });
@@ -567,8 +587,7 @@ if (sessionTokens.size > 500) cleanupSessionTokens();
 req.sessionHint = hint;
 next();
 } catch (err) {
-    return res.status(403).json({ error: `Invalid session hint: ${err.message}` });
-    return res.status(403).json({ error: "Ewan" });
+return res.status(403).json({ error: "Ewan" });
 }
 };
 
@@ -595,6 +614,10 @@ const { hint, ts, sig } = generateHint();
 sessionTokens.set(hint, {
 usesLeft: SESSION_MAX_USES,
 exp: Date.now() + SESSION_TTL_MS,
+      ip: req.ip || req.connection?.remoteAddress || "unknown",
+      userAgent: req.headers["user-agent"] || "unknown"
+      // ip: req.ip || req.connection?.remoteAddress || "unknown",
+      // userAgent: req.headers["user-agent"] || "unknown"
 });
 res.json({ hint: `${hint}.${ts}.${sig}` });
 } catch (err) {
@@ -666,8 +689,7 @@ cache = { data: result, timestamp: now };
 res.setHeader("X-Cache", "MISS");
 res.json(result);
 } catch (err) {
-    res.status(500).json({ error: "Server error", message: err.message });
-    res.status(500).json({ error: "Server error" });
+res.status(500).json({ error: "Server error" });
 }
 });
 
@@ -760,33 +782,30 @@ if (rawData.payment.channel !== "cash") {
 if (!clientRef || clientRef.length < 5) {
 return res
 .status(400)
-            .json({ error: "Invalid reference tracking length." });
-            .json({ error: "Unauthorized" });
+.json({ error: "Unauthorized" });
 }
 if (await isRefAlreadyUsed(clientRef)) {
 return res
 .status(409)
 .json({
-              error: "Duplicate transaction reference code tracking conflict.",
-              error: "Unauthorized",
+error: "Unauthorized",
 });
 }
 }
 
+const sanitizeText = (str, maxLen) => String(str || "").replace(/[<>]/g, "").trim().slice(0, maxLen);
+
 const sanitizedGuest = {
-name: String(rawData.guest.name || "").slice(0, 80),
-email: String(rawData.guest.email || "").slice(0, 80),
-phone: String(rawData.guest.phone || "").slice(0, 30),
-age: String(rawData.guest.age || ""),
-nationality: String(rawData.guest.nationality || "").slice(0, 30),
-address: String(rawData.guest.address || "").slice(0, 200),
-arrivalTime: String(rawData.guest.arrivalTime || ""),
-departureTime: String(rawData.guest.departureTime || ""),
-port: String(rawData.guest.port || "").slice(0, 50),
-specialRequest: String(rawData.guest.specialRequest || "").slice(
-0,
-500,
-),
+name: sanitizeText(rawData.guest.name, 80),
+email: sanitizeText(rawData.guest.email, 80),
+phone: sanitizeText(rawData.guest.phone, 30),
+age: sanitizeText(rawData.guest.age, 10),
+nationality: sanitizeText(rawData.guest.nationality, 30),
+address: sanitizeText(rawData.guest.address, 200),
+arrivalTime: sanitizeText(rawData.guest.arrivalTime, 20),
+departureTime: sanitizeText(rawData.guest.departureTime, 20),
+port: sanitizeText(rawData.guest.port, 50),
+specialRequest: sanitizeText(rawData.guest.specialRequest, 500),
 };
 
 const VALID_ROOM_NAMES = Object.keys(ROOM_NAME_TO_APT_ID); // ["Barkada Room","Couple Room","Family Room 1","Family Room 2","Bunk Beds"]
@@ -872,8 +891,7 @@ error: `${room.name} is not available for the selected dates. Please choose diff
 const VALID_CHANNELS = ["gcash","maya","metro","land","cash"];
 const paymentChannel = String(rawData.payment.channel);
 if (!VALID_CHANNELS.includes(paymentChannel)) {
-        return res.status(400).json({ error: "Invalid payment channel." });
-        return res.status(400).json({ error: "Unauthorized" });
+return res.status(400).json({ error: "Unauthorized" });
 }
 
 const paymentType =
@@ -887,8 +905,7 @@ paymentType === "full"
 const clientAmount = Number(rawData.payment.amount);
 const clientGrandTotal = Number(rawData.payment.grandTotal);
 if (Math.abs(clientAmount - finalAmountPaid) > 1 || Math.abs(clientGrandTotal - calculatedGrandTotal) > 1) {
-        return res.status(400).json({ error: "Price mismatch detected. Please refresh and try again." });
-        return res.status(400).json({ error: "Unauthorized" });
+return res.status(400).json({ error: "Unauthorized" });
 }
 
 const serverBookingId = await generateUniqueBookingId();
@@ -965,8 +982,7 @@ paymentChannel === "cash"
 });
 } catch (err) {
 console.error("[Booking Create Error]", err);
-      res.status(500).json({ error: "Server error", message: err.message });
-      res.status(500).json({ error: "Server error"  });
+res.status(500).json({ error: "Server error"  });
 }
 },
 );
