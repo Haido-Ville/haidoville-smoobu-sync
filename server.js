@@ -1,17 +1,19 @@
 // ============================================================
-// HAIDOVILLE × SMOOBU SYNC - Render.com Server v3.7
+// HAIDOVILLE × SMOOBU SYNC - Render.com Server v4.1
 // ============================================================
-// v3.7 CHANGES:
-// - ADDED: AES-256-GCM encryption on /availability, /booking-token,
-//          and /bookings/create responses (encryption.js module)
-// - ADDED: POST /decrypt — frontend decryption endpoint
-// - Key derived via PBKDF2 x600k iterations (bcrypt-equivalent)
-// - All other endpoints and security measures unchanged from v3.6
+// v4.1 CHANGES (on top of v4.0):
+// - FIX: Double startup rotation so JWT_SECRET is never present
+//        in JWT_PREV_SEC after boot. Both CURR and PREV are now
+//        fresh random keys from the first request onward.
+// - FIX: /bookings query params (from/to) now validated with
+//        the same isValidDate() used in /bookings/create.
 // ============================================================
 
 import express from "express";
 import rateLimit from "express-rate-limit";
+import helmet from "helmet";
 import { Resend } from "resend";
+import "dotenv/config"; 
 
 import path from "path";
 import fs from "fs";
@@ -20,8 +22,6 @@ import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
 import {
-  encryptResponse,
-  encryptForSession,
   generateHint,
   verifyHint,
 } from "./encryption.js";
@@ -29,6 +29,7 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.set("trust proxy", 1);
+app.use(helmet());
 const PORT = process.env.PORT || 3000;
 
 // ---- Config ----
@@ -37,6 +38,7 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "";
 const FROM_EMAIL = process.env.FROM_EMAIL || "onboarding@resend.dev";
 const GHL_WEBHOOK_URL = process.env.GHL_WEBHOOK_URL || "";
+const GHL_INQUIRY_WEBHOOK_URL = process.env.GHL_INQUIRY_WEBHOOK_URL || "";
 const CACHE_DURATION_MS = 5 * 60 * 1000;
 const CREATE_SMOOBU_DRAFT = process.env.CREATE_SMOOBU_DRAFT === "true";
 
@@ -44,9 +46,9 @@ const CREATE_SMOOBU_DRAFT = process.env.CREATE_SMOOBU_DRAFT === "true";
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
 const CALENDAR_ACCESS_TOKEN = process.env.CALENDAR_ACCESS_TOKEN;
 const JWT_SECRET = process.env.JWT_SECRET;
-let JWT_CURR_SEC = process.env.JWT_CURR_SEC || JWT_SECRET;
-let JWT_PREV_SEC = process.env.JWT_PREV_SEC || JWT_SECRET;
-const JWT_EXPIRATION = process.env.JWT_EXPIRATION || "10m";
+let JWT_CURR_SEC = JWT_SECRET;
+let JWT_PREV_SEC = JWT_SECRET;
+const JWT_EXPIRATION = process.env.JWT_EXPIRATION || "90s";
 const JWT_ROTATE_MS = process.env.JWT_ROTATE_MS ? parseInt(process.env.JWT_ROTATE_MS, 10) : 12 * 60 * 60 * 1000;
 
 function rotateJwtKeys() {
@@ -54,9 +56,13 @@ function rotateJwtKeys() {
   JWT_CURR_SEC = crypto.randomBytes(32).toString('hex');
   console.log(`[JWT] Keys rotated at ${new Date().toISOString()}. Previous key retired, new key generated.`);
 }
+// FIX: Rotate TWICE on startup so JWT_SECRET is flushed from both
+// CURR and PREV. After two rotations both are random — JWT_SECRET
+// is never used as a verification key from the very first request.
+rotateJwtKeys();
+rotateJwtKeys();
 setInterval(rotateJwtKeys, JWT_ROTATE_MS);
 
-// ============================================================
 // ============================================================
 // PERSISTENT REFERENCE NUMBER STORE (Dedup)
 // ============================================================
@@ -118,19 +124,23 @@ function isHolyWeekDate(date) {
   return diffDays >= 0 && diffDays <= 7;
 }
 
+// ---- Shared date validation helper (used in /bookings and /bookings/create) ----
+const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+function isValidDate(str) {
+  if (!DATE_REGEX.test(str)) return false;
+  const d = new Date(str + 'T00:00:00');
+  return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === str;
+}
+
 // ---- Booking ID generator ----
 async function generateUniqueBookingId() {
   const now = new Date();
   const yymm =
     String(now.getFullYear()).slice(-2) +
     String(now.getMonth() + 1).padStart(2, "0");
-  
-  // Use a highly unique UUID prefix to prevent collisions
   const uniquePart = uuidv4().split('-')[0].toUpperCase();
   return `HV-${yymm}-${uniquePart}`;
 }
-
-
 
 // ---- Server-Side Pricing Function ----
 function calculateRoomPrice(roomName, pax, nights, checkIn, checkOut) {
@@ -235,9 +245,7 @@ app.use((req, res, next) => {
 const requireApiKey = (req, res, next) => {
   const clientKey = req.headers["x-api-key"];
   if (!clientKey || clientKey !== INTERNAL_API_KEY) {
-    return res
-      .status(401)
-      .json({ error: "Unauthorized" });
+    return res.status(401).json({ error: "Unauthorized" });
   }
   next();
 };
@@ -251,42 +259,58 @@ const requireCalendarAccess = (req, res, next) => {
 };
 
 // ============================================================
-// TIMESTAMP DRIFT MIDDLEWARE (Vuln D — Replay Attack Prevention)
-// Rejects requests whose X-Timestamp header is older than 5 minutes
-// or missing on state-changing endpoints.
+// TIMESTAMP DRIFT MIDDLEWARE (Replay Attack Prevention)
 // ============================================================
-const MAX_TIMESTAMP_DRIFT_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_TIMESTAMP_DRIFT_MS = 5 * 60 * 1000;
 
 const requireFreshTimestamp = (req, res, next) => {
   const raw = req.headers["x-timestamp"];
-  if (!raw) {
-    return res.status(400).json({ error: "Unauthorized" });
-  }
+  if (!raw) return res.status(400).json({ error: "Unauthorized" });
   const incoming = parseInt(raw, 10);
-  if (isNaN(incoming)) {
-    return res.status(400).json({ error: "Unauthorized" });
-  }
-  const drift = Math.abs(Date.now() - incoming);
-  if (drift > MAX_TIMESTAMP_DRIFT_MS) {
+  if (isNaN(incoming)) return res.status(400).json({ error: "Unauthorized" });
+  if (Math.abs(Date.now() - incoming) > MAX_TIMESTAMP_DRIFT_MS) {
     return res.status(400).json({ error: "Unauthorized" });
   }
   next();
 };
 
 // ============================================================
-// ONE-TIME USE JWT VALIDATION
+// ONE-TIME USE JWT VALIDATION (persisted to disk)
 // ============================================================
+const USED_TOKENS_FILE = path.join(__dirname, "data", "used_tokens.json");
 const usedTokens = new Map();
+
+try {
+  if (fs.existsSync(USED_TOKENS_FILE)) {
+    const stored = JSON.parse(fs.readFileSync(USED_TOKENS_FILE, "utf8"));
+    const now = Date.now();
+    for (const [jti, exp] of stored) {
+      if (now < exp) usedTokens.set(jti, exp);
+    }
+    console.log(`[JWT] Loaded ${usedTokens.size} unexpired JTIs from disk.`);
+  }
+} catch (e) {
+  console.error("[JWT] Error loading used tokens:", e.message);
+}
+
+function persistUsedTokens() {
+  try {
+    const now = Date.now();
+    const entries = [];
+    for (const [jti, exp] of usedTokens) {
+      if (now < exp) entries.push([jti, exp]);
+      else usedTokens.delete(jti);
+    }
+    fs.writeFileSync(USED_TOKENS_FILE, JSON.stringify(entries));
+  } catch (e) {
+    console.error("[JWT] Error persisting used tokens:", e.message);
+  }
+}
 
 const requireJwtToken = (req, res, next) => {
   const authHeader = req.headers["authorization"];
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res
-      .status(403)
-      .json({
-        error:
-          "Unauthorized",
-      });
+    return res.status(403).json({ error: "Unauthorized" });
   }
   const token = authHeader.split(" ")[1];
   let decoded;
@@ -296,26 +320,15 @@ const requireJwtToken = (req, res, next) => {
     try {
       decoded = jwt.verify(token, JWT_PREV_SEC);
     } catch (e2) {
-      try {
-        decoded = jwt.verify(token, JWT_SECRET);
-      } catch (e3) {
-        return res.status(403).json({ error: "Invalid or expired token." });
-      }
+      return res.status(403).json({ error: "Invalid or expired token." });
     }
   }
 
   if (usedTokens.has(decoded.jti)) {
-    return res
-      .status(401)
-      .json({ error: "Unauthorized" });
+    return res.status(401).json({ error: "Unauthorized" });
   }
   usedTokens.set(decoded.jti, decoded.exp * 1000);
-  if (usedTokens.size > 1000) {
-    const now = Date.now();
-    for (const [id, exp] of usedTokens) {
-      if (now > exp) usedTokens.delete(id);
-    }
-  }
+  persistUsedTokens();
   next();
 };
 
@@ -327,9 +340,7 @@ const bookingRateLimiter = rateLimit({
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
-  message: {
-    error: "Too many requests. Please wait a moment and try again.",
-  },
+  message: { error: "Too many requests. Please wait a moment and try again." },
 });
 
 const tokenRateLimiter = rateLimit({
@@ -337,19 +348,37 @@ const tokenRateLimiter = rateLimit({
   max: 20,
   standardHeaders: true,
   legacyHeaders: false,
-  message: {
-    error: "Too many requests. Please wait a moment and try again.",
-  },
+  message: { error: "Too many requests. Please wait a moment and try again." },
+});
+
+const pingRateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 12,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please wait a moment and try again." },
+});
+
+const availabilityRateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please wait a moment and try again." },
+});
+
+const inquiryRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please wait a moment and try again." },
 });
 
 // ============================================================
-// GET /ping  ← NEW v3.6: Public keep-alive endpoint (no auth)
+// GET /ping — Public keep-alive endpoint (no auth)
 // ============================================================
-// Used by the frontend keep-alive and UptimeRobot.
-// Returns 200 with a minimal payload — no sensitive data.
-// No auth required because it reveals nothing about the system.
-// ============================================================
-app.get("/ping", (req, res) => {
+app.get("/ping", pingRateLimiter, (req, res) => {
   res.json({ ok: true, ts: Date.now() });
 });
 
@@ -362,32 +391,30 @@ app.post("/internal/rotate-jwt", requireApiKey, (req, res) => {
 });
 
 // ============================================================
-// GET /  — Protected health check (internal use only)
+// GET / — Protected health check (internal use only)
 // ============================================================
 app.get("/", requireApiKey, (req, res) => {
-  res.json(
-    encryptResponse({
-      service: "HaidoVille Smoobu Sync",
-      version: "3.7",
-      status: "online",
-      features: {
-        smoobuSync: !!SMOOBU_API_KEY,
-        email: !!RESEND_API_KEY && !!ADMIN_EMAIL,
-        ghlWebhook: !!GHL_WEBHOOK_URL,
-        smoobuDraft: CREATE_SMOOBU_DRAFT && !!SMOOBU_API_KEY,
-        encryption: "AES-256-GCM",
-      },
-      endpoints: {
-        ping: "GET /ping",
-        availability: "GET /availability (encrypted)",
-        bookings: "GET /bookings (encrypted)",
-        bookingToken: "GET /booking-token (encrypted)",
-        apartments: "GET /apartments-list (encrypted)",
-        createBooking: "POST /bookings/create",
-      },
-      timestamp: new Date().toISOString(),
-    })
-  );
+  res.json({
+    service: "HaidoVille Smoobu Sync",
+    version: "4.1",
+    status: "online",
+    features: {
+      smoobuSync: !!SMOOBU_API_KEY,
+      email: !!RESEND_API_KEY && !!ADMIN_EMAIL,
+      ghlWebhook: !!GHL_WEBHOOK_URL,
+      smoobuDraft: CREATE_SMOOBU_DRAFT && !!SMOOBU_API_KEY,
+    },
+    endpoints: {
+      ping: "GET /ping",
+      availability: "GET /availability",
+      bookings: "GET /bookings",
+      bookingToken: "GET /booking-token",
+      apartments: "GET /apartments-list",
+      createBooking: "POST /bookings/create",
+      inquiry: "POST /inquiry",
+    },
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // ============================================================
@@ -410,21 +437,19 @@ app.get("/apartments-list", requireApiKey, async (req, res) => {
     apartments.forEach((apt) => {
       sampleMapping[apt.id] = `'${apt.name}'`;
     });
-    res.json(
-      encryptResponse({
-        instructions: "Copy IDs at gamitin sa APARTMENT_MAP",
-        totalApartments: apartments.length,
-        apartments,
-        sampleMapping,
-      })
-    );
+    res.json({
+      instructions: "Copy IDs at gamitin sa APARTMENT_MAP",
+      totalApartments: apartments.length,
+      apartments,
+      sampleMapping,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // ============================================================
-// GET /bookings  (protected calendar sync — internal/admin use)
+// GET /bookings (protected calendar sync — internal/admin use)
 // ============================================================
 app.get("/bookings", requireCalendarAccess, async (req, res) => {
   if (!SMOOBU_API_KEY)
@@ -435,7 +460,7 @@ app.get("/bookings", requireCalendarAccess, async (req, res) => {
   if (!nocache && cache.data && now - cache.timestamp < CACHE_DURATION_MS) {
     res.setHeader("X-Cache", "HIT");
     res.setHeader("X-Cache-Age", Math.floor((now - cache.timestamp) / 1000));
-    return res.json(encryptForSession(cache.data, req.headers["x-session-hint"] || ""));
+    return res.json(cache.data);
   }
 
   try {
@@ -444,10 +469,19 @@ app.get("/bookings", requireCalendarAccess, async (req, res) => {
     oneYearLater.setFullYear(oneYearLater.getFullYear() + 1);
     const toDate = oneYearLater.toISOString().slice(0, 10);
 
-    const fromDate =
-      typeof req.query.from === "string" ? req.query.from.slice(0, 10) : today;
-    const endDate =
-      typeof req.query.to === "string" ? req.query.to.slice(0, 10) : toDate;
+    // FIX: Validate query param dates before passing to Smoobu
+    const rawFrom = typeof req.query.from === "string" ? req.query.from.slice(0, 10) : null;
+    const rawTo   = typeof req.query.to   === "string" ? req.query.to.slice(0, 10)   : null;
+
+    if (rawFrom && !isValidDate(rawFrom)) {
+      return res.status(400).json({ error: "Invalid 'from' date format. Use YYYY-MM-DD." });
+    }
+    if (rawTo && !isValidDate(rawTo)) {
+      return res.status(400).json({ error: "Invalid 'to' date format. Use YYYY-MM-DD." });
+    }
+
+    const fromDate = rawFrom || today;
+    const endDate  = rawTo   || toDate;
 
     const allBookings = [];
     let page = 1;
@@ -468,13 +502,11 @@ app.get("/bookings", requireCalendarAccess, async (req, res) => {
 
       if (!smoobuRes.ok) {
         const errText = await smoobuRes.text();
-        return res
-          .status(smoobuRes.status)
-          .json({
-            error: "Smoobu API error",
-            status: smoobuRes.status,
-            detail: errText,
-          });
+        return res.status(smoobuRes.status).json({
+          error: "Smoobu API error",
+          status: smoobuRes.status,
+          detail: errText,
+        });
       }
 
       const data = await smoobuRes.json();
@@ -487,7 +519,7 @@ app.get("/bookings", requireCalendarAccess, async (req, res) => {
     const result = buildAvailabilityResult(allBookings);
     cache = { data: result, timestamp: now };
     res.setHeader("X-Cache", "MISS");
-    res.json(encryptResponse(result));
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: "Server error", message: err.message });
   }
@@ -496,7 +528,7 @@ app.get("/bookings", requireCalendarAccess, async (req, res) => {
 // ============================================================
 // SESSION TOKENS — capped uses, self-expiring
 // ============================================================
-const sessionTokens = new Map(); // hint -> { usesLeft, exp }
+const sessionTokens = new Map();
 const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS) || 10 * 60 * 1000;
 const SESSION_MAX_USES = parseInt(process.env.SESSION_MAX_USES) || 15;
 
@@ -510,17 +542,12 @@ function cleanupSessionTokens() {
 const requireValidSessionHint = (req, res, next) => {
   const header = req.headers["x-session-hint"] || "";
   const parts = header.split(".");
-  if (parts.length !== 3) {
-    return res.status(400).json({ error: "Unauthorized" });
-  }
+  if (parts.length !== 3) return res.status(400).json({ error: "Unauthorized" });
   const [hint, ts, sig] = parts;
   try {
     verifyHint(hint, ts, sig);
-
     const session = sessionTokens.get(hint);
-    if (!session) {
-      return res.status(401).json({ error: "Session expired, reload the page" });
-    }
+    if (!session) return res.status(401).json({ error: "Session expired, reload the page" });
     if (Date.now() > session.exp) {
       sessionTokens.delete(hint);
       return res.status(401).json({ error: "Session expired, reload the page" });
@@ -530,35 +557,28 @@ const requireValidSessionHint = (req, res, next) => {
       sessionTokens.delete(hint);
       return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
     }
-
     req.sessionHint = hint;
     next();
   } catch (err) {
-    return res.status(403).json({ error: "Ewan" });
+    return res.status(403).json({ error: "Unauthorized" });
   }
 };
-
 
 const requireSessionHint = (req, res, next) => {
   const header = req.headers["x-session-hint"] || "";
   const parts = header.split(".");
-  if (parts.length !== 3) {
-    return res.status(400).json({ error: "Unauthorized" });
-  }
+  if (parts.length !== 3) return res.status(400).json({ error: "Unauthorized" });
   const [hint, ts, sig] = parts;
   try {
     verifyHint(hint, ts, sig);
-
     const session = sessionTokens.get(hint);
-    if (!session) {
-      return res.status(401).json({ error: "Session expired, reload the page" });
-    }
+    if (!session) return res.status(401).json({ error: "Session expired, reload the page" });
     if (Date.now() > session.exp) {
       sessionTokens.delete(hint);
       return res.status(401).json({ error: "Session expired, reload the page" });
     }
     const currentUa = req.headers["user-agent"] || "unknown";
-    if (session.userAgent !== currentUa) {
+    if (session.userAgent !== currentUa || session.ip !== req.ip) {
       sessionTokens.delete(hint);
       return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
     }
@@ -566,44 +586,40 @@ const requireSessionHint = (req, res, next) => {
       sessionTokens.delete(hint);
       return res.status(401).json({ error: "Session expired, reload the page" });
     }
-
     session.usesLeft -= 1;
     if (session.usesLeft <= 0) sessionTokens.delete(hint);
     if (sessionTokens.size > 500) cleanupSessionTokens();
-
     req.sessionHint = hint;
     next();
   } catch (err) {
-    return res.status(403).json({ error: "Ewan" });
+    return res.status(403).json({ error: "Unauthorized" });
   }
 };
 
 // ============================================================
-// GET /api/session-hint  — Issues a signed hint per page-load
+// GET /api/session-hint — Issues a signed hint per page-load
 // ============================================================
 app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
-  const origin = req.headers.origin || req.headers.referer;
+  const origin = req.headers.origin || "";
   const allowedOrigins = [
     "https://haidoville.com",
     "https://app.haidoville.com",
-    "https://www.haidoville.com",
-    "http://127.0.0.1",
-    "http://localhost"
+    "https://www.haidoville.com"
   ];
-  
-  const isAllowed = allowedOrigins.some(allowed => origin && origin.startsWith(allowed));
-  if (!isAllowed) {
+  if (!allowedOrigins.includes(origin)) {
     return res.status(403).json({ error: "Unauthorized" });
   }
-
   try {
     const { hint, ts, sig } = generateHint();
+    const csrfToken = uuidv4();
     sessionTokens.set(hint, {
       usesLeft: SESSION_MAX_USES,
       exp: Date.now() + SESSION_TTL_MS,
-      userAgent: req.headers["user-agent"] || "unknown"
+      userAgent: req.headers["user-agent"] || "unknown",
+      ip: req.ip,
+      csrfToken: csrfToken
     });
-    res.json({ hint: `${hint}.${ts}.${sig}` });
+    res.json({ hint: `${hint}.${ts}.${sig}`, csrfToken });
   } catch (err) {
     console.error("[session-hint] Failed:", err.message);
     res.status(500).json({ error: "Could not generate session hint." });
@@ -611,28 +627,28 @@ app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
 });
 
 // ============================================================
-// GET /api/payment-methods  — Serves payment data
+// GET /api/payment-methods — Serves payment data
 // ============================================================
-app.get("/api/payment-methods", tokenRateLimiter, requireValidSessionHint, (req, res) => {
+app.get("/api/payment-methods", tokenRateLimiter, requireSessionHint, (req, res) => {
   res.json({
     payments: {
-      gcash: { number: "0977-395-5742", owner: "Arturo Valler" },
-      maya: { number: "0977-395-5742", owner: "Arturo Valler" },
-      metrobank: { account: "4773-9043-68947", owner: "Jenalyn M. Valler" },
-      landbank: { account: "1096-1263-16", owner: "Jenalyn M. Valler" }
+      gcash: { number: process.env.GCASH_NUMBER, owner: process.env.GCASH_OWNER },
+      maya: { number: process.env.MAYA_NUMBER, owner: process.env.MAYA_OWNER },
+      metrobank: { account: process.env.METROBANK_ACCOUNT, owner: process.env.METROBANK_OWNER },
+      landbank: { account: process.env.LANDBANK_ACCOUNT, owner: process.env.LANDBANK_OWNER }
     }
   });
 });
 
 // ============================================================
-// GET /availability  (public — no auth, no PII)
+// GET /availability (public — no auth, no PII)
 // ============================================================
-app.get("/availability", requireValidSessionHint, async (req, res) => {
+app.get("/availability", availabilityRateLimiter, requireValidSessionHint, async (req, res) => {
   const now = Date.now();
   if (cache.data && now - cache.timestamp < CACHE_DURATION_MS) {
     res.setHeader("X-Cache", "HIT");
     res.setHeader("X-Cache-Age", Math.floor((now - cache.timestamp) / 1000));
-    return res.json(encryptResponse(cache.data));
+    return res.json(cache.data);
   }
 
   if (!SMOOBU_API_KEY)
@@ -645,8 +661,7 @@ app.get("/availability", requireValidSessionHint, async (req, res) => {
     const toDate = oneYearLater.toISOString().slice(0, 10);
 
     const allBookings = [];
-    let page = 1,
-      totalPages = 1;
+    let page = 1, totalPages = 1;
 
     do {
       const url = new URL("https://login.smoobu.com/api/reservations");
@@ -671,7 +686,7 @@ app.get("/availability", requireValidSessionHint, async (req, res) => {
     const result = buildAvailabilityResult(allBookings);
     cache = { data: result, timestamp: now };
     res.setHeader("X-Cache", "MISS");
-    res.json(encryptResponse(result));
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: "Server error" });
   }
@@ -719,71 +734,48 @@ function buildAvailabilityResult(allBookings) {
 }
 
 // ============================================================
-// GET /booking-token  (public — issues one-time JWT)
+// GET /booking-token (public — issues one-time JWT)
 // ============================================================
 app.get("/booking-token", tokenRateLimiter, requireSessionHint, (req, res) => {
   const jti = uuidv4();
-  // Sign new tokens with the current rotating key
   const token = jwt.sign({ jti }, JWT_CURR_SEC, { expiresIn: JWT_EXPIRATION });
-  res.json(encryptForSession({ token }, req.headers["x-session-hint"] || ""));
+  res.json({ token });
 });
 
-
-
+// ============================================================
+// POST /bookings/create
 // ============================================================
 let bookingMutex = Promise.resolve();
-  app.post(
-    "/bookings/create",
+app.post(
+  "/bookings/create",
   requireJwtToken,
   requireSessionHint,
   requireFreshTimestamp,
   bookingRateLimiter,
   async (req, res) => {
-    let releaseMutex;
-    const acquired = new Promise(r => releaseMutex = r);
-    const prev = bookingMutex;
-    bookingMutex = acquired;
-    await prev;
+    let releaseMutex = null;
     try {
       const rawData = req.body;
 
-      if (
-        !rawData ||
-        !rawData.bookingId ||
-        !rawData.guest ||
-        !rawData.rooms ||
-        !rawData.payment
-      ) {
+      if (!rawData || !rawData.bookingId || !rawData.guest || !rawData.rooms || !rawData.payment) {
         return res.status(400).json({ error: "Missing required fields" });
       }
 
-      if (
-        !Array.isArray(rawData.rooms) ||
-        rawData.rooms.length === 0 ||
-        rawData.rooms.length > 5
-      ) {
-        return res
-          .status(400)
-          .json({ error: "Invalid room allocation parameters boundary." });
+      if (!Array.isArray(rawData.rooms) || rawData.rooms.length === 0 || rawData.rooms.length > 5) {
+        return res.status(400).json({ error: "Invalid room allocation parameters boundary." });
       }
 
       const clientRef = String(rawData.payment.referenceNumber || "").trim();
       if (rawData.payment.channel !== "cash") {
         if (!clientRef || clientRef.length < 5) {
-          return res
-            .status(400)
-            .json({ error: "Unauthorized" });
+          return res.status(400).json({ error: "Unauthorized" });
         }
         if (await isRefAlreadyUsed(clientRef)) {
-          return res
-            .status(409)
-            .json({
-              error: "Unauthorized",
-            });
+          return res.status(409).json({ error: "Unauthorized" });
         }
       }
 
-      const sanitizeText = (str, maxLen) => String(str || "").replace(/[<>]/g, "").trim().slice(0, maxLen);
+      const sanitizeText = (str, maxLen) => String(str || "").replace(/[<>\r\n]/g, "").trim().slice(0, maxLen);
 
       const sanitizedGuest = {
         name: sanitizeText(rawData.guest.name, 80),
@@ -801,8 +793,7 @@ let bookingMutex = Promise.resolve();
         return res.status(400).json({ error: "Invalid email address." });
       }
 
-
-      const VALID_ROOM_NAMES = Object.keys(ROOM_NAME_TO_APT_ID); // ["Barkada Room","Couple Room","Family Room 1","Family Room 2","Bunk Beds"]
+      const VALID_ROOM_NAMES = Object.keys(ROOM_NAME_TO_APT_ID);
 
       for (const room of rawData.rooms) {
         if (!VALID_ROOM_NAMES.includes(String(room.name))) {
@@ -810,37 +801,40 @@ let bookingMutex = Promise.resolve();
         }
       }
 
+      const todayStr = new Date().toISOString().slice(0, 10);
+
       const sanitizedRooms = rawData.rooms.map((room) => ({
         name: String(room.name),
         checkIn: String(room.checkIn).slice(0, 10),
         checkOut: String(room.checkOut).slice(0, 10),
         nights: Math.max(1, Math.min(30, parseInt(room.nights) || 1)),
         pax: Math.max(1, Math.min(9, parseInt(room.pax) || 1)),
-        paxLabel: room.name === "Bunk Beds" ? "Beds" : "Guests", // derive server-side, never trust client
+        paxLabel: room.name === "Bunk Beds" ? "Beds" : "Guests",
       }));
 
       for (const room of sanitizedRooms) {
+        if (!isValidDate(room.checkIn) || !isValidDate(room.checkOut)) {
+          return res.status(400).json({ error: "Invalid date format." });
+        }
+        if (room.checkIn < todayStr) {
+          return res.status(400).json({ error: "Check-in date cannot be in the past." });
+        }
+        if (room.checkOut <= room.checkIn) {
+          return res.status(400).json({ error: "Check-out must be after check-in." });
+        }
         const ci = new Date(room.checkIn + 'T00:00:00');
         const co = new Date(room.checkOut + 'T00:00:00');
-        const stayNights = Math.round(
-          (co - ci) / 86400000
-        );
+        const stayNights = Math.round((co - ci) / 86400000);
         if (stayNights < 2) {
-          return res.status(400).json({
-            error: 'Minimum stay is 2 nights.',
-          });
+          return res.status(400).json({ error: 'Minimum stay is 2 nights.' });
         }
         room.nights = stayNights;
       }
-      
+
       let calculatedGrandTotal = 0;
       const finalProcessedRooms = sanitizedRooms.map((room) => {
         const calculatedSubtotal = calculateRoomPrice(
-          room.name,
-          room.pax,
-          room.nights,
-          room.checkIn,
-          room.checkOut,
+          room.name, room.pax, room.nights, room.checkIn, room.checkOut,
         );
         calculatedGrandTotal += calculatedSubtotal;
         return { ...room, subtotal: calculatedSubtotal };
@@ -850,14 +844,9 @@ let bookingMutex = Promise.resolve();
         for (const room of sanitizedRooms) {
           if (room.name === "Bunk Beds") {
             const bedsNeeded = parseInt(room.pax) || 1;
-            const freeApts = await findAvailableBunkApartments(
-              room.checkIn,
-              room.checkOut,
-            );
+            const freeApts = await findAvailableBunkApartments(room.checkIn, room.checkOut);
             if (freeApts.length < bedsNeeded) {
-              console.warn(
-                `[Availability] Bunk Beds: need ${bedsNeeded} beds, only ${freeApts.length} free for ${room.checkIn} → ${room.checkOut}.`,
-              );
+              console.warn(`[Availability] Bunk Beds: need ${bedsNeeded} beds, only ${freeApts.length} free for ${room.checkIn} → ${room.checkOut}.`);
               return res.status(409).json({
                 error: `Not enough bunk beds available for the selected dates. Only ${freeApts.length} bed${freeApts.length !== 1 ? "s" : ""} left — you requested ${bedsNeeded}. Please adjust your dates or number of beds.`,
               });
@@ -866,15 +855,9 @@ let bookingMutex = Promise.resolve();
           }
           const aptId = NON_BUNK_ROOM_APT_IDS[room.name];
           if (!aptId) continue;
-          const isAvailable = await checkNonBunkAvailability(
-            aptId,
-            room.checkIn,
-            room.checkOut,
-          );
+          const isAvailable = await checkNonBunkAvailability(aptId, room.checkIn, room.checkOut);
           if (!isAvailable) {
-            console.warn(
-              `[Availability] ${room.name} is already booked for ${room.checkIn} → ${room.checkOut}.`,
-            );
+            console.warn(`[Availability] ${room.name} is already booked for ${room.checkIn} → ${room.checkOut}.`);
             return res.status(409).json({
               error: `${room.name} is not available for the selected dates. Please choose different dates or a different room.`,
             });
@@ -888,22 +871,28 @@ let bookingMutex = Promise.resolve();
         return res.status(400).json({ error: "Unauthorized" });
       }
 
-      const paymentType =
-        String(rawData.payment.type) === "full" ? "full" : "dp";
-      const finalAmountPaid =
-        paymentType === "full"
-          ? calculatedGrandTotal
-          : Math.ceil(calculatedGrandTotal * 0.5);
+      const paymentType = String(rawData.payment.type) === "full" ? "full" : "dp";
+      const finalAmountPaid = paymentType === "full"
+        ? calculatedGrandTotal
+        : Math.ceil(calculatedGrandTotal * 0.5);
 
-      // --- Security Validation: Prevent Price Manipulation ---
+      // Strict price validation — no tolerance
       const clientAmount = Number(rawData.payment.amount);
       const clientGrandTotal = Number(rawData.payment.grandTotal);
-      if (Math.abs(clientAmount - finalAmountPaid) > 1 || Math.abs(clientGrandTotal - calculatedGrandTotal) > 1) {
+      if (clientAmount !== finalAmountPaid || clientGrandTotal !== calculatedGrandTotal) {
         return res.status(400).json({ error: "Unauthorized" });
       }
 
-      const serverBookingId = await generateUniqueBookingId();
+      const acquired = new Promise(r => releaseMutex = r);
+      const prev = bookingMutex;
+      bookingMutex = acquired;
+      await prev;
 
+      if (paymentChannel !== "cash" && await isRefAlreadyUsed(clientRef)) {
+        return res.status(409).json({ error: "Unauthorized" });
+      }
+
+      const serverBookingId = await generateUniqueBookingId();
 
       const data = {
         bookingId: serverBookingId,
@@ -914,8 +903,7 @@ let bookingMutex = Promise.resolve();
         payment: {
           channel: paymentChannel,
           type: paymentType,
-          referenceNumber:
-            paymentChannel === "cash" ? `CASH-${Date.now()}` : clientRef,
+          referenceNumber: paymentChannel === "cash" ? `CASH-${Date.now()}` : clientRef,
           amount: finalAmountPaid,
           grandTotal: calculatedGrandTotal,
         },
@@ -928,59 +916,94 @@ let bookingMutex = Promise.resolve();
       pendingBookings.push({ ...data, receivedAt: new Date().toISOString() });
 
       const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-      while (
-        pendingBookings.length > 0 &&
-        new Date(pendingBookings[0].receivedAt).getTime() < weekAgo
-      ) {
+      while (pendingBookings.length > 0 && new Date(pendingBookings[0].receivedAt).getTime() < weekAgo) {
         pendingBookings.shift();
       }
 
-      console.log(
-        "[Booking Received]",
-        data.bookingId,
-        "-",
-        data.guest.name,
-        "(",
-        data.guest.email,
-        ") source:",
-        data.source,
-      );
+      console.log("[Booking Received]", data.bookingId, "-", data.guest.name, "(", data.guest.email, ") source:", data.source);
 
       if (GHL_WEBHOOK_URL) {
-        forwardToGHL(data).catch((err) =>
-          console.error("[GHL Webhook Error]", err.message),
-        );
+        forwardToGHL(data).catch((err) => console.error("[GHL Webhook Error]", err.message));
       }
 
       if (RESEND_API_KEY && ADMIN_EMAIL) {
-        sendBookingEmail(data).catch((err) =>
-          console.error("[Email Error]", err.message),
-        );
+        sendBookingEmail(data).catch((err) => console.error("[Email Error]", err.message));
       }
 
       if (CREATE_SMOOBU_DRAFT && SMOOBU_API_KEY) {
         createSmoobuDraft(data)
-          .then(() => {
-            cache = { data: null, timestamp: 0 };
-          })
+          .then(() => { cache = { data: null, timestamp: 0 }; })
           .catch((err) => console.error("[Smoobu Draft Error]", err.message));
       }
 
-      res.json(encryptForSession({
-          success: true,
-          bookingId: data.bookingId,
-          message:
-            paymentChannel === "cash"
-              ? "Booking confirmed! Please pay in cash upon arrival."
-              : "Booking reserved. Please complete payment.",
-        }, req.headers["x-session-hint"] || ""));
+      res.json({
+        success: true,
+        bookingId: data.bookingId,
+        message: paymentChannel === "cash"
+          ? "Booking confirmed! Please pay in cash upon arrival."
+          : "Booking reserved. Please complete payment.",
+      });
     } catch (err) {
       console.error("[Booking Create Error]", err);
-      res.status(500).json({ error: "Server error"  });
+      res.status(500).json({ error: "Server error" });
     } finally {
-      releaseMutex();
+      if (typeof releaseMutex === 'function') releaseMutex();
     }
   },
+);
+
+// ============================================================
+// POST /inquiry — Proxy for GHL Inquiry Webhook
+// ============================================================
+app.post(
+  "/inquiry",
+  requireSessionHint,
+  inquiryRateLimiter,
+  express.urlencoded({ extended: true }),
+  async (req, res) => {
+    try {
+      const header = req.headers["x-session-hint"] || "";
+      const hint = header.split(".")[0];
+      const session = sessionTokens.get(req.sessionHint);
+      
+      if (!req.body.csrfToken || req.body.csrfToken !== session.csrfToken) {
+        return res.status(403).json({ error: "Invalid CSRF token" });
+      }
+      session.csrfToken = null;
+
+      if (!GHL_INQUIRY_WEBHOOK_URL) {
+        return res.status(500).json({ error: "Inquiry webhook not configured." });
+      }
+
+      const INQUIRY_ALLOWED_FIELDS = [
+        'full_name', 'phone', 'email',
+        'quote_checkin_date', 'quote_checkout_date',
+        'quote_number_of_pax', 'quote_preferred_room_type',
+        'quote_message'
+      ];
+      const params = new URLSearchParams();
+      for (const key of INQUIRY_ALLOWED_FIELDS) {
+        if (req.body[key] !== undefined) {
+          params.append(key, String(req.body[key]).slice(0, 1000));
+        }
+      }
+
+      const response = await fetch(GHL_INQUIRY_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString()
+      });
+
+      if (!response.ok) {
+        throw new Error("GHL responded with status " + response.status);
+      }
+
+      res.json({ success: true, message: "Inquiry sent successfully." });
+    } catch (err) {
+      console.error("[Inquiry Proxy Error]", err.message);
+      res.status(500).json({ error: "Could not send inquiry at this time." });
+    }
+  }
 );
 
 // ============================================================
@@ -999,10 +1022,7 @@ async function checkNonBunkAvailability(apartmentId, checkIn, checkOut) {
     });
 
     if (!response.ok) {
-      console.warn(
-        `[Availability] Smoobu fetch failed for apt ${apartmentId}. Blocking as precaution. Status:`,
-        response.status,
-      );
+      console.warn(`[Availability] Smoobu fetch failed for apt ${apartmentId}. Blocking as precaution. Status:`, response.status);
       return false;
     }
 
@@ -1012,22 +1032,14 @@ async function checkNonBunkAvailability(apartmentId, checkIn, checkOut) {
     for (const b of bookings) {
       if (b.type === "cancellation") continue;
       if (b.apartment?.id !== apartmentId) continue;
-      if (
-        b.arrival &&
-        b.departure &&
-        b.arrival < checkOut &&
-        b.departure > checkIn
-      ) {
+      if (b.arrival && b.departure && b.arrival < checkOut && b.departure > checkIn) {
         return false;
       }
     }
 
     return true;
   } catch (err) {
-    console.error(
-      `[Availability] Error checking apt ${apartmentId}:`,
-      err.message,
-    );
+    console.error(`[Availability] Error checking apt ${apartmentId}:`, err.message);
     return false;
   }
 }
@@ -1050,10 +1062,7 @@ async function findAvailableBunkApartments(checkIn, checkOut) {
     });
 
     if (!response.ok) {
-      console.warn(
-        "[Bunk Picker] Smoobu fetch failed — failing safe. Status:",
-        response.status,
-      );
+      console.warn("[Bunk Picker] Smoobu fetch failed — failing safe. Status:", response.status);
       return [];
     }
 
@@ -1065,27 +1074,13 @@ async function findAvailableBunkApartments(checkIn, checkOut) {
       if (b.type === "cancellation") continue;
       const aptId = b.apartment?.id;
       if (!BUNK_APARTMENT_IDS.includes(aptId)) continue;
-      if (
-        b.arrival &&
-        b.departure &&
-        b.arrival < checkOut &&
-        b.departure > checkIn
-      ) {
+      if (b.arrival && b.departure && b.arrival < checkOut && b.departure > checkIn) {
         bookedIds.add(aptId);
       }
     }
 
     const freeIds = BUNK_APARTMENT_IDS.filter((id) => !bookedIds.has(id));
-    console.log(
-      "[Bunk Picker]",
-      checkIn,
-      "→",
-      checkOut,
-      "| booked:",
-      bookedIds.size,
-      "| free IDs:",
-      freeIds,
-    );
+    console.log("[Bunk Picker]", checkIn, "→", checkOut, "| booked:", bookedIds.size, "| free IDs:", freeIds);
     return freeIds;
   } catch (err) {
     console.error("[Bunk Picker] Error — failing safe:", err.message);
@@ -1105,10 +1100,7 @@ async function createSmoobuDraft(data) {
     let apartmentIds = [];
 
     if (isBunk) {
-      const freeApts = await findAvailableBunkApartments(
-        room.checkIn,
-        room.checkOut,
-      );
+      const freeApts = await findAvailableBunkApartments(room.checkIn, room.checkOut);
       if (freeApts.length === 0) {
         console.warn("[Smoobu Draft] No free bunk apartments, skipping.");
         continue;
@@ -1134,8 +1126,7 @@ async function createSmoobuDraft(data) {
 
     for (let i = 0; i < apartmentIds.length; i++) {
       const apartmentId = apartmentIds[i];
-      const bedSuffix =
-        isBunk && isMulti ? ` (Bed ${i + 1}/${apartmentIds.length})` : "";
+      const bedSuffix = isBunk && isMulti ? ` (Bed ${i + 1}/${apartmentIds.length})` : "";
 
       const payload = {
         arrivalDate: room.checkIn,
@@ -1154,36 +1145,16 @@ async function createSmoobuDraft(data) {
       };
 
       try {
-        const response = await fetch(
-          "https://login.smoobu.com/api/reservations",
-          {
-            method: "POST",
-            headers: {
-              "Api-Key": SMOOBU_API_KEY,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify(payload),
-          },
-        );
+        const response = await fetch("https://login.smoobu.com/api/reservations", {
+          method: "POST",
+          headers: { "Api-Key": SMOOBU_API_KEY, "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
         const result = await response.json();
         if (response.ok) {
-          console.log(
-            "[Smoobu Draft Created]",
-            data.bookingId,
-            "room:",
-            room.name + bedSuffix,
-            "aptId:",
-            apartmentId,
-            "smoobuId:",
-            result.id,
-          );
+          console.log("[Smoobu Draft Created]", data.bookingId, "room:", room.name + bedSuffix, "aptId:", apartmentId, "smoobuId:", result.id);
         } else {
-          console.warn(
-            "[Smoobu Draft Failed]",
-            "aptId:",
-            apartmentId,
-            JSON.stringify(result),
-          );
+          console.warn("[Smoobu Draft Failed]", "aptId:", apartmentId, JSON.stringify(result));
         }
       } catch (err) {
         console.error("[Smoobu Draft Network Error]", err.message);
@@ -1213,7 +1184,6 @@ async function sendBookingEmail(data) {
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#x27;");
 
-
   const resend = new Resend(RESEND_API_KEY);
   const channelNames = {
     gcash: "GCash",
@@ -1229,8 +1199,7 @@ async function sendBookingEmail(data) {
     : `<strong>⏰ ACTION NEEDED:</strong><br>Wait for customer's receipt via Messenger (m.me/haidoville), then verify payment and update Smoobu booking status to paid.`;
 
   const roomsHtml = data.rooms
-    .map(
-      (r, i) => `
+    .map((r, i) => `
     <tr>
       <td style="padding:8px 0;border-bottom:1px solid #eee;">
         <strong>Room ${i + 1}: ${esc(r.name)}</strong><br>
@@ -1238,8 +1207,7 @@ async function sendBookingEmail(data) {
         <small style="color:#666;">${r.pax} ${esc(r.paxLabel)} • ₱${r.subtotal.toLocaleString()}</small>
       </td>
     </tr>
-  `,
-    )
+  `)
     .join("");
 
   const html = `
@@ -1315,30 +1283,20 @@ function buildGhlPayload(data) {
     land: "Landbank",
     cash: "Cash on Arrival (Walk-in)",
   };
-  const paymentMethod =
-    channelLabels[data.payment.channel] || data.payment.channel;
+  const paymentMethod = channelLabels[data.payment.channel] || data.payment.channel;
   const firstRoom = data.rooms[0] || {};
 
   const fmtShortDate = (d) => {
     if (!d) return "";
     try {
       return new Date(d + "T00:00:00").toLocaleDateString("en-US", {
-        month: "short",
-        day: "numeric",
-        year: "numeric",
+        month: "short", day: "numeric", year: "numeric",
       });
-    } catch (e) {
-      return d;
-    }
+    } catch (e) { return d; }
   };
 
-  const confirmationDate = new Date(
-    data.submittedAt || new Date(),
-  ).toLocaleDateString("en-US", {
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-    timeZone: "Asia/Manila",
+  const confirmationDate = new Date(data.submittedAt || new Date()).toLocaleDateString("en-US", {
+    month: "long", day: "numeric", year: "numeric", timeZone: "Asia/Manila",
   });
 
   const fmtTime12 = (t) => {
@@ -1355,13 +1313,8 @@ function buildGhlPayload(data) {
   const dpAmount = data.payment.amount;
   const balance = grandTotal - dpAmount;
   let roomType = firstRoom.name || "";
-  if (data.rooms.length > 1)
-    roomType = data.rooms.map((r) => r.name).join(" + ");
-  const totalPax = data.rooms.reduce(
-    (sum, r) => sum + (parseInt(r.pax) || 0),
-    0,
-  );
-
+  if (data.rooms.length > 1) roomType = data.rooms.map((r) => r.name).join(" + ");
+  const totalPax = data.rooms.reduce((sum, r) => sum + (parseInt(r.pax) || 0), 0);
   const totalNights = Math.max(...data.rooms.map((r) => parseInt(r.nights) || 0));
 
   return {
@@ -1394,8 +1347,7 @@ function buildGhlPayload(data) {
     total_amount: String(grandTotal),
     dp_amount: String(dpAmount),
     balance: String(balance),
-    payment_type:
-      data.payment.type === "full" ? "Full Payment" : "Downpayment (50%)",
+    payment_type: data.payment.type === "full" ? "Full Payment" : "Downpayment (50%)",
     special_request: data.guest.specialRequest || "",
     room_count: String(data.rooms.length),
     all_rooms: data.rooms.map((r) => ({
@@ -1415,11 +1367,7 @@ function buildGhlPayload(data) {
 app.listen(PORT, () => {
   console.log(`🚀 Secure HaidoVille Smoobu Sync running on port ${PORT}`);
   console.log(`   Smoobu API:    ${SMOOBU_API_KEY ? "✅" : "❌"}`);
-  console.log(
-    `   Email:         ${RESEND_API_KEY && ADMIN_EMAIL ? "✅" : "⚠️  disabled"}`,
-  );
-  console.log(
-    `   GHL Webhook:   ${GHL_WEBHOOK_URL ? "✅" : "⚠️  not configured"}`,
-  );
+  console.log(`   Email:         ${RESEND_API_KEY && ADMIN_EMAIL ? "✅" : "⚠️  disabled"}`);
+  console.log(`   GHL Webhook:   ${GHL_WEBHOOK_URL ? "✅" : "⚠️  not configured"}`);
   console.log(`   Smoobu Drafts: ${CREATE_SMOOBU_DRAFT ? "✅ ON" : "❌ OFF"}`);
 });

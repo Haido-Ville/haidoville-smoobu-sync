@@ -1,26 +1,10 @@
-// ============================================================
-// REPLACEMENT FOR hvLoadBooked() FUNCTION
-// ============================================================
-// Hanapin mo sa existing code mo yung function na ito:
-//
-//   async function hvLoadBooked() {
-//     bookedRanges = [];
-//     bunkBookings = [];
-//     pendingRanges = [];
-//     familyBookedUnits = [];
-//     return [];
-//   }
-//
-// Palitan mo ng EXACT NA ETO SA BABA.
-// Wala nang ibang mababago sa buong code mo.
-// Yung Step 1–4 flow, cart system, Holy Week logic — lahat nanatili.
-// ============================================================
+// This file can be deleted...
+
+
+
+
 
 // ⚠️ PALITAN MO ITO NG ACTUAL RENDER URL MO AFTER DEPLOY
-// Example: 'https://haidoville-smoobu-sync.onrender.com/availability'
-const SMOOBU_PROXY_URL = 'https://haidoville-smoobu-sync.onrender.com/availability';
-
-const BROWSER_DECRYPT_KEY = 'TtmULtv+9xsmhC2j5UNfFSCIFAE4PHDW';
 
 // ============================================================
 // GLOBAL SESSION HINT SINGLETON
