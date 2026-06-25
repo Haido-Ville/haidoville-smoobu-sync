@@ -31,17 +31,55 @@ const app = express();
 app.set("trust proxy", 1);
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
+
   contentSecurityPolicy: {
+    useDefaults: false, // take full control
     directives: {
-      defaultSrc: ["'none'"], // API doesn't need to load external resources
+      defaultSrc:     ["'self'"],
+      scriptSrc:      ["'self'", "'unsafe-inline'", "'unsafe-eval'"],  // fixes script-src violation
+      styleSrc:       ["'self'", "'unsafe-inline'"],
+      connectSrc:     ["'self'", "https://haidoville.com"],            // fixes connect-src 'none' blocking Cloudflare RUM
+      imgSrc:         ["'self'", "data:", "https:"],
+      fontSrc:        ["'self'", "https:", "data:"],
+      objectSrc:      ["'none'"],
+      frameAncestors: ["'self'"],
+      baseUri:        ["'self'"],
+      formAction:     ["'self'"],
+      upgradeInsecureRequests: [],
     },
+    reportOnly: false, // ← set to true only when testing; false enforces the policy
   },
-  xssFilter: true, // X-XSS-Protection
-  noSniff: true, // X-Content-Type-Options
-  frameguard: { action: "sameorigin" }, // X-Frame-Options
-  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true }, // Strict-Transport-Security
-  referrerPolicy: { policy: "strict-origin-when-cross-origin" } // Referrer-Policy
+
+  // X-XSS-Protection
+  xssFilter: true,
+
+  // X-Content-Type-Options
+  noSniff: true,
+
+  // X-Frame-Options
+  frameguard: { action: "sameorigin" },
+
+  // Strict-Transport-Security
+  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+
+  // Referrer-Policy
+  referrerPolicy: { policy: "strict-origin-when-cross-origin" },
 }));
+
+// Permissions-Policy — must be added manually, helmet doesn't set this header
+app.use((req, res, next) => {
+  res.setHeader(
+    "Permissions-Policy",
+    [
+      "accelerometer=()",
+      "gyroscope=()",
+      "magnetometer=()",
+      "microphone=()",
+      "usb=()",
+    ].join(", ")
+  );
+  next();
+});
 const PORT = process.env.PORT || 3000;
 
 // ---- Config ----
