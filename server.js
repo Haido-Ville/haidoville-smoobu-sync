@@ -64,9 +64,9 @@ const JWT_EXPIRATION = process.env.JWT_EXPIRATION || "90s";
 const JWT_ROTATE_MS = process.env.JWT_ROTATE_MS ? parseInt(process.env.JWT_ROTATE_MS, 10) : 12 * 60 * 60 * 1000;
 
 function rotateJwtKeys() {
-JWT_PREV_SEC = JWT_CURR_SEC;
-JWT_CURR_SEC = crypto.randomBytes(32).toString('hex');
-console.log(`[JWT] Keys rotated at ${new Date().toISOString()}. Previous key retired, new key generated.`);
+  JWT_PREV_SEC = JWT_CURR_SEC;
+  JWT_CURR_SEC = crypto.randomBytes(32).toString('hex');
+  console.log(`[JWT] Keys rotated at ${new Date().toISOString()}. Previous key retired, new key generated.`);
 }
 // FIX: Rotate TWICE on startup so JWT_SECRET is flushed from both
 // CURR and PREV. After two rotations both are random — JWT_SECRET
@@ -82,58 +82,58 @@ const REF_FILE = path.join(__dirname, "data", "processed_refs.json");
 let processedReferenceNumbers = new Set();
 
 try {
-if (fs.existsSync(REF_FILE)) {
-const data = JSON.parse(fs.readFileSync(REF_FILE, "utf8"));
-processedReferenceNumbers = new Set(data);
-} else {
-fs.mkdirSync(path.join(__dirname, "data"), { recursive: true });
-fs.writeFileSync(REF_FILE, JSON.stringify([]));
-}
+  if (fs.existsSync(REF_FILE)) {
+    const data = JSON.parse(fs.readFileSync(REF_FILE, "utf8"));
+    processedReferenceNumbers = new Set(data);
+  } else {
+    fs.mkdirSync(path.join(__dirname, "data"), { recursive: true });
+    fs.writeFileSync(REF_FILE, JSON.stringify([]));
+  }
 } catch (e) {
-console.error("Error loading reference numbers:", e.message);
+  console.error("Error loading reference numbers:", e.message);
 }
 
 async function isRefAlreadyUsed(refNum) {
-return processedReferenceNumbers.has(refNum);
+  return processedReferenceNumbers.has(refNum);
 }
 
 async function markRefAsUsed(refNum) {
-processedReferenceNumbers.add(refNum);
-if (processedReferenceNumbers.size > 10000) {
-const it = processedReferenceNumbers.values();
-processedReferenceNumbers.delete(it.next().value);
-}
-try {
-fs.writeFileSync(REF_FILE, JSON.stringify([...processedReferenceNumbers]));
-} catch(e) {
-console.error("Error saving reference numbers:", e.message);
-}
+  processedReferenceNumbers.add(refNum);
+  if (processedReferenceNumbers.size > 10000) {
+    const it = processedReferenceNumbers.values();
+    processedReferenceNumbers.delete(it.next().value);
+  }
+  try {
+    fs.writeFileSync(REF_FILE, JSON.stringify([...processedReferenceNumbers]));
+  } catch(e) {
+    console.error("Error saving reference numbers:", e.message);
+  }
 }
 
 // ---- Holy Week Date Helper ----
 function getEaster(year) {
-const a = year % 19;
-const b = Math.floor(year / 100);
-const c = year % 100;
-const d = Math.floor(b / 4);
-const e = b % 4;
-const f = Math.floor((b + 8) / 25);
-const g = Math.floor((b - f + 1) / 3);
-const h = (19 * a + b - d - g + 15) % 30;
-const i = Math.floor(c / 4);
-const k = c % 4;
-const l = (32 + 2 * e + 2 * i - h - k) % 7;
-const m = Math.floor((a + 11 * h + 22 * l) / 451);
-const month = Math.floor((h + l - 7 * m + 114) / 31) - 1;
-const day = ((h + l - 7 * m + 114) % 31) + 1;
-return new Date(year, month, day);
+  const a = year % 19;
+  const b = Math.floor(year / 100);
+  const c = year % 100;
+  const d = Math.floor(b / 4);
+  const e = b % 4;
+  const f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4);
+  const k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31) - 1;
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+  return new Date(year, month, day);
 }
 
 function isHolyWeekDate(date) {
-const d = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-const easter = getEaster(d.getFullYear());
-const diffDays = Math.floor((easter.getTime() - d.getTime()) / 86400000);
-return diffDays >= 0 && diffDays <= 7;
+  const d = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const easter = getEaster(d.getFullYear());
+  const diffDays = Math.floor((easter.getTime() - d.getTime()) / 86400000);
+  return diffDays >= 0 && diffDays <= 7;
 }
 
 // ---- Shared date validation helper (used in /bookings and /bookings/create) ----
@@ -156,71 +156,71 @@ async function generateUniqueBookingId() {
 
 // ---- Server-Side Pricing Function ----
 function calculateRoomPrice(roomName, pax, nights, checkIn, checkOut) {
-nights = Math.max(1, nights);
-pax = Math.max(1, pax);
+  nights = Math.max(1, nights);
+  pax = Math.max(1, pax);
 
-switch (roomName) {
-case "Bunk Beds": {
-if (pax < 1 || pax > 6) throw new Error("Bunk Beds max is 6 beds.");
-if (checkIn && checkOut) {
-let total = 0;
-const start = new Date(checkIn + "T00:00:00");
-const end = new Date(checkOut + "T00:00:00");
-const msPerDay = 86400000;
-const numNights = Math.round((end - start) / msPerDay);
-for (let i = 0; i < numNights; i++) {
-const night = new Date(start.getTime() + i * msPerDay);
-total += (isHolyWeekDate(night) ? 600 : 500) * pax;
-}
-return total;
-}
-return 500 * pax * nights;
-}
-case "Couple Room":
-if (pax <= 2) return 1200 * nights;
-if (pax === 3) return 1500 * nights;
-throw new Error("Couple Room max pax is 3.");
-case "Barkada Room":
-if (pax >= 6 && pax <= 7) return 3500 * nights;
-if (pax >= 8 && pax <= 9) return 500 * pax * nights;
-throw new Error("Barkada Room pax must be 6–9.");
-case "Family Room 1":
-case "Family Room 2":
-if (pax >= 1 && pax <= 5) return 2500 * nights;
-if (pax === 6) return 3000 * nights;
-throw new Error("Family Room max pax is 6.");
-default:
-throw new Error(`Unknown room: ${roomName}`);
-}
+  switch (roomName) {
+    case "Bunk Beds": {
+      if (pax < 1 || pax > 6) throw new Error("Bunk Beds max is 6 beds.");
+      if (checkIn && checkOut) {
+        let total = 0;
+        const start = new Date(checkIn + "T00:00:00");
+        const end = new Date(checkOut + "T00:00:00");
+        const msPerDay = 86400000;
+        const numNights = Math.round((end - start) / msPerDay);
+        for (let i = 0; i < numNights; i++) {
+          const night = new Date(start.getTime() + i * msPerDay);
+          total += (isHolyWeekDate(night) ? 600 : 500) * pax;
+        }
+        return total;
+      }
+      return 500 * pax * nights;
+    }
+    case "Couple Room":
+      if (pax <= 2) return 1200 * nights;
+      if (pax === 3) return 1500 * nights;
+      throw new Error("Couple Room max pax is 3.");
+    case "Barkada Room":
+      if (pax >= 6 && pax <= 7) return 3500 * nights;
+      if (pax >= 8 && pax <= 9) return 500 * pax * nights;
+      throw new Error("Barkada Room pax must be 6–9.");
+    case "Family Room 1":
+    case "Family Room 2":
+      if (pax >= 1 && pax <= 5) return 2500 * nights;
+      if (pax === 6) return 3000 * nights;
+      throw new Error("Family Room max pax is 6.");
+    default:
+      throw new Error(`Unknown room: ${roomName}`);
+  }
 }
 
 // ---- Apartment Mapping ----
 const APARTMENT_MAP = {
-3261782: "barkada",
-3261742: "couple",
-3261662: { roomId: "family", unit: "Family Room 1" },
-3261737: { roomId: "family", unit: "Family Room 2" },
-3261752: { roomId: "bunk", beds: 1 },
-3261757: { roomId: "bunk", beds: 1 },
-3261762: { roomId: "bunk", beds: 1 },
-3261767: { roomId: "bunk", beds: 1 },
-3261772: { roomId: "bunk", beds: 1 },
-3261777: { roomId: "bunk", beds: 1 },
+  3261782: "barkada",
+  3261742: "couple",
+  3261662: { roomId: "family", unit: "Family Room 1" },
+  3261737: { roomId: "family", unit: "Family Room 2" },
+  3261752: { roomId: "bunk", beds: 1 },
+  3261757: { roomId: "bunk", beds: 1 },
+  3261762: { roomId: "bunk", beds: 1 },
+  3261767: { roomId: "bunk", beds: 1 },
+  3261772: { roomId: "bunk", beds: 1 },
+  3261777: { roomId: "bunk", beds: 1 },
 };
 
 const ROOM_NAME_TO_APT_ID = {
-"Barkada Room": 3261782,
-"Couple Room": 3261742,
-"Family Room 1": 3261662,
-"Family Room 2": 3261737,
-"Bunk Beds": [3261752, 3261757, 3261762, 3261767, 3261772, 3261777],
+  "Barkada Room": 3261782,
+  "Couple Room": 3261742,
+  "Family Room 1": 3261662,
+  "Family Room 2": 3261737,
+  "Bunk Beds": [3261752, 3261757, 3261762, 3261767, 3261772, 3261777],
 };
 
 const NON_BUNK_ROOM_APT_IDS = {
-"Barkada Room": 3261782,
-"Couple Room": 3261742,
-"Family Room 1": 3261662,
-"Family Room 2": 3261737,
+  "Barkada Room": 3261782,
+  "Couple Room": 3261742,
+  "Family Room 1": 3261662,
+  "Family Room 2": 3261737,
 };
 
 const BUNK_APARTMENT_IDS = ROOM_NAME_TO_APT_ID["Bunk Beds"];
@@ -234,24 +234,24 @@ app.use(express.json({ limit: "1mb" }));
 
 // Strict CORS
 app.use((req, res, next) => {
-const origin = req.headers.origin || "";
-const allowedOrigins = [
-"https://haidoville.com",
-"https://app.haidoville.com/",
-"https://www.haidoville.com",
-];
-if (allowedOrigins.includes(origin)) {
-res.setHeader("Access-Control-Allow-Origin", origin);
-res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-res.setHeader(
-"Access-Control-Allow-Headers",
-"Content-Type, X-API-Key, X-Calendar-Access, Authorization, X-Session-Hint, X-Timestamp"
-);
-} else {
-res.setHeader("Access-Control-Allow-Origin", "https://haidoville.com");
-}
-if (req.method === "OPTIONS") return res.status(200).end();
-next();
+  const origin = req.headers.origin || "";
+  const allowedOrigins = [
+    "https://haidoville.com",
+    "https://app.haidoville.com",
+    "https://www.haidoville.com",
+  ];
+  if (allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, X-API-Key, X-Calendar-Access, Authorization, X-Session-Hint, X-Timestamp"
+    );
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "https://haidoville.com");
+  }
+  if (req.method === "OPTIONS") return res.status(200).end();
+  next();
 });
 
 const requireApiKey = (req, res, next) => {
@@ -263,11 +263,11 @@ const requireApiKey = (req, res, next) => {
 };
 
 const requireCalendarAccess = (req, res, next) => {
-const calToken = req.headers["x-calendar-access"];
-if (!calToken || calToken !== CALENDAR_ACCESS_TOKEN) {
-    return res.status(403).json({ error: "Unauthorized." });
-}
-next();
+  const calToken = req.headers["x-calendar-access"];
+  if (!calToken || calToken !== CALENDAR_ACCESS_TOKEN) {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
+  next();
 };
 
 // ============================================================
@@ -398,8 +398,8 @@ app.get("/ping", pingRateLimiter, (req, res) => {
 // POST /internal/rotate-jwt — Manually trigger JWT key rotation
 // ============================================================
 app.post("/internal/rotate-jwt", requireApiKey, (req, res) => {
-rotateJwtKeys();
-res.json({ ok: true, message: "JWT keys rotated successfully.", ts: Date.now() });
+  rotateJwtKeys();
+  res.json({ ok: true, message: "JWT keys rotated successfully.", ts: Date.now() });
 });
 
 // ============================================================
@@ -545,10 +545,10 @@ const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS) || 10 * 60 * 1000;
 const SESSION_MAX_USES = parseInt(process.env.SESSION_MAX_USES) || 15;
 
 function cleanupSessionTokens() {
-const now = Date.now();
-for (const [hint, session] of sessionTokens) {
-if (now > session.exp || session.usesLeft <= 0) sessionTokens.delete(hint);
-}
+  const now = Date.now();
+  for (const [hint, session] of sessionTokens) {
+    if (now > session.exp || session.usesLeft <= 0) sessionTokens.delete(hint);
+  }
 }
 
 const requireValidSessionHint = (req, res, next) => {
@@ -706,43 +706,43 @@ app.get("/availability", availabilityRateLimiter, requireValidSessionHint, async
 
 // Shared helper — builds the availability result from Smoobu bookings array
 function buildAvailabilityResult(allBookings) {
-const result = {
-bookedRanges: [],
-bunkBookings: [],
-familyBookedUnits: [],
-bunkTotal: BUNK_APARTMENT_IDS.length,
-updatedAt: new Date().toISOString(),
-totalBookings: allBookings.length,
-};
+  const result = {
+    bookedRanges: [],
+    bunkBookings: [],
+    familyBookedUnits: [],
+    bunkTotal: BUNK_APARTMENT_IDS.length,
+    updatedAt: new Date().toISOString(),
+    totalBookings: allBookings.length,
+  };
 
-for (const booking of allBookings) {
-if (booking.type === "cancellation") continue;
-const apartmentId = booking.apartment?.id;
-const arrival = booking.arrival;
-const departure = booking.departure;
-if (!apartmentId || !arrival || !departure) continue;
+  for (const booking of allBookings) {
+    if (booking.type === "cancellation") continue;
+    const apartmentId = booking.apartment?.id;
+    const arrival = booking.arrival;
+    const departure = booking.departure;
+    if (!apartmentId || !arrival || !departure) continue;
 
-const mapping = APARTMENT_MAP[apartmentId];
-if (!mapping) {
-result.bookedRanges.push({ _unmapped: true, ci: arrival, co: departure });
-continue;
-}
+    const mapping = APARTMENT_MAP[apartmentId];
+    if (!mapping) {
+      result.bookedRanges.push({ _unmapped: true, ci: arrival, co: departure });
+      continue;
+    }
 
-const range = { ci: arrival, co: departure };
+    const range = { ci: arrival, co: departure };
 
-if (typeof mapping === "string") {
-if (mapping === "bunk") result.bunkBookings.push({ ...range, beds: 1 });
-else result.bookedRanges.push({ ...range, room: mapping });
-} else if (typeof mapping === "object") {
-if (mapping.roomId === "bunk")
-result.bunkBookings.push({ ...range, beds: mapping.beds || 1 });
-else if (mapping.roomId === "family")
-result.familyBookedUnits.push({ ...range, unit: mapping.unit });
-else result.bookedRanges.push({ ...range, room: mapping.roomId });
-}
-}
+    if (typeof mapping === "string") {
+      if (mapping === "bunk") result.bunkBookings.push({ ...range, beds: 1 });
+      else result.bookedRanges.push({ ...range, room: mapping });
+    } else if (typeof mapping === "object") {
+      if (mapping.roomId === "bunk")
+        result.bunkBookings.push({ ...range, beds: mapping.beds || 1 });
+      else if (mapping.roomId === "family")
+        result.familyBookedUnits.push({ ...range, unit: mapping.unit });
+      else result.bookedRanges.push({ ...range, room: mapping.roomId });
+    }
+  }
 
-return result;
+  return result;
 }
 
 // ============================================================
@@ -1176,10 +1176,10 @@ async function createSmoobuDraft(data) {
 }
 
 function resolveApartmentId(roomName) {
-const mapping = ROOM_NAME_TO_APT_ID[roomName];
-if (!mapping) return null;
-if (Array.isArray(mapping)) return mapping[0];
-return mapping;
+  const mapping = ROOM_NAME_TO_APT_ID[roomName];
+  if (!mapping) return null;
+  if (Array.isArray(mapping)) return mapping[0];
+  return mapping;
 }
 
 // ============================================================
@@ -1270,18 +1270,18 @@ async function sendBookingEmail(data) {
 // HELPER: Forward to GHL Webhook
 // ============================================================
 async function forwardToGHL(data) {
-if (!GHL_WEBHOOK_URL) return;
-const payload = buildGhlPayload(data);
-const response = await fetch(GHL_WEBHOOK_URL, {
-method: "POST",
-headers: { "Content-Type": "application/json" },
-body: JSON.stringify(payload),
-});
-if (!response.ok) {
-const errText = await response.text();
-throw new Error(`GHL webhook failed (${response.status}): ${errText}`);
-}
-console.log("[GHL Webhook Sent]", data.bookingId, "source:", payload.source);
+  if (!GHL_WEBHOOK_URL) return;
+  const payload = buildGhlPayload(data);
+  const response = await fetch(GHL_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`GHL webhook failed (${response.status}): ${errText}`);
+  }
+  console.log("[GHL Webhook Sent]", data.bookingId, "source:", payload.source);
 }
 
 function buildGhlPayload(data) {
