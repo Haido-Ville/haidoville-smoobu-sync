@@ -29,7 +29,19 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.set("trust proxy", 1);
-app.use(helmet());
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'none'"], // API doesn't need to load external resources
+    },
+  },
+  xssFilter: true, // X-XSS-Protection
+  noSniff: true, // X-Content-Type-Options
+  frameguard: { action: "sameorigin" }, // X-Frame-Options
+  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true }, // Strict-Transport-Security
+  referrerPolicy: { policy: "strict-origin-when-cross-origin" } // Referrer-Policy
+}));
 const PORT = process.env.PORT || 3000;
 
 // ---- Config ----
