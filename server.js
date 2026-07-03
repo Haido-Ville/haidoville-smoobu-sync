@@ -1019,7 +1019,6 @@ app.post(
       if (!req.body.csrfToken || req.body.csrfToken !== session.csrfToken) {
         return res.status(403).json({ error: "Invalid CSRF token" });
       }
-      session.csrfToken = null;
 
       if (!GHL_INQUIRY_WEBHOOK_URL) {
         return res.status(500).json({ error: "Inquiry webhook not configured." });
@@ -1048,6 +1047,7 @@ app.post(
         throw new Error("GHL responded with status " + response.status);
       }
 
+      session.csrfToken = null; // Destroy token only on success
       res.json({ success: true, message: "Inquiry sent successfully." });
     } catch (err) {
       console.error("[Inquiry Proxy Error]", err.message);
