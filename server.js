@@ -579,8 +579,8 @@ app.get("/bookings", requireCalendarAccess, async (req, res) => {
 // SESSION TOKENS — capped uses, self-expiring
 // ============================================================
 const sessionTokens = new Map();
-const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS) || 10 * 60 * 1000;
-const SESSION_MAX_USES = parseInt(process.env.SESSION_MAX_USES) || 15;
+const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS) || 60 * 60 * 1000;
+const SESSION_MAX_USES = parseInt(process.env.SESSION_MAX_USES) || 50;
 
 function cleanupSessionTokens() {
   const now = Date.now();
