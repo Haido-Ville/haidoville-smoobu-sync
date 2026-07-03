@@ -429,7 +429,7 @@ const inquiryRateLimiter = rateLimit({
 // GET /ping — Public keep-alive endpoint (no auth)
 // ============================================================
 app.get("/ping", pingRateLimiter, (req, res) => {
-  res.json({ ok: true, ts: Date.now() });
+  res.json({ ok: true });
 });
 
 // ============================================================
@@ -437,7 +437,7 @@ app.get("/ping", pingRateLimiter, (req, res) => {
 // ============================================================
 app.post("/internal/rotate-jwt", requireApiKey, (req, res) => {
   rotateJwtKeys();
-  res.json({ ok: true, message: "JWT keys rotated successfully.", ts: Date.now() });
+  res.json({ ok: true, message: "JWT keys rotated successfully." });
 });
 
 // ============================================================
@@ -463,7 +463,7 @@ app.get("/", requireApiKey, (req, res) => {
       createBooking: "POST /bookings/create",
       inquiry: "POST /inquiry",
     },
-    timestamp: new Date().toISOString(),
+
   });
 });
 
@@ -509,7 +509,7 @@ app.get("/bookings", requireCalendarAccess, async (req, res) => {
   const now = Date.now();
   if (!nocache && cache.data && now - cache.timestamp < CACHE_DURATION_MS) {
     res.setHeader("X-Cache", "HIT");
-    res.setHeader("X-Cache-Age", Math.floor((now - cache.timestamp) / 1000));
+    // X-Cache-Age header removed to prevent server clock leakage
     return res.json(cache.data);
   }
 
@@ -710,7 +710,7 @@ app.get("/availability", availabilityRateLimiter, requireValidSessionHint, async
   const now = Date.now();
   if (cache.data && now - cache.timestamp < CACHE_DURATION_MS) {
     res.setHeader("X-Cache", "HIT");
-    res.setHeader("X-Cache-Age", Math.floor((now - cache.timestamp) / 1000));
+    // X-Cache-Age header removed to prevent server clock leakage
     return res.json(cache.data);
   }
 
@@ -762,7 +762,7 @@ function buildAvailabilityResult(allBookings) {
     bunkBookings: [],
     familyBookedUnits: [],
     bunkTotal: BUNK_APARTMENT_IDS.length,
-    updatedAt: new Date().toISOString(),
+
     totalBookings: allBookings.length,
   };
 
