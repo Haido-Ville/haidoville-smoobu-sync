@@ -614,6 +614,18 @@ const requireValidSessionHint = (req, res, next) => {
   }
 };
 
+// Extract subnet from IP for loose-match comparison
+// IPv4: keeps first 3 octets (e.g. 203.0.113.x → 203.0.113)
+// IPv6: keeps first 3 groups (/48) (e.g. 2001:db8:abcd:xxxx → 2001:db8:abcd)
+function extractSubnet(ip) {
+  if (!ip) return "unknown";
+  const cleaned = ip.replace(/^::ffff:/, ""); 
+  if (cleaned.includes(":")) {
+    return cleaned.split(":").slice(0, 3).join(":");
+  }
+  return cleaned.split(".").slice(0, 3).join(".");
+}
+
 const requireSessionHint = (req, res, next) => {
   const header = req.headers["x-session-hint"] || "";
   const parts = header.split(".");
@@ -628,7 +640,8 @@ const requireSessionHint = (req, res, next) => {
       return res.status(401).json({ error: "Session expired, reload the page" });
     }
     const currentUa = req.headers["user-agent"] || "unknown";
-    if (session.userAgent !== currentUa || session.ip !== req.ip) {
+    const currentSubnet = extractSubnet(req.ip);
+    if (session.userAgent !== currentUa || session.subnet !== currentSubnet) {
       sessionTokens.delete(hint);
       return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
     }
@@ -666,7 +679,7 @@ app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
       usesLeft: SESSION_MAX_USES,
       exp: Date.now() + SESSION_TTL_MS,
       userAgent: req.headers["user-agent"] || "unknown",
-      ip: req.ip,
+      subnet: extractSubnet(req.ip),
       csrfToken: csrfToken
     });
     res.json({ hint: `${hint}.${ts}.${sig}`, csrfToken });
