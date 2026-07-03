@@ -35,16 +35,16 @@ app.use(helmet({
   contentSecurityPolicy: {
     useDefaults: false, // take full control
     directives: {
-      defaultSrc:     ["'self'"],
-      scriptSrc:      ["'self'", "'unsafe-inline'", "'unsafe-eval'"],  // fixes script-src violation
-      styleSrc:       ["'self'", "'unsafe-inline'"],
-      connectSrc:     ["'self'", "https://haidoville.com"],            // fixes connect-src 'none' blocking Cloudflare RUM
-      imgSrc:         ["'self'", "data:", "https:"],
-      fontSrc:        ["'self'", "https:", "data:"],
+      defaultSrc:     ["'none'"],
+      scriptSrc:      ["'none'"],
+      styleSrc:       ["'none'"],
+      connectSrc:     ["'none'"],
+      imgSrc:         ["'none'"],
+      fontSrc:        ["'none'"],
       objectSrc:      ["'none'"],
-      frameAncestors: ["'self'"],
+      frameAncestors: ["'none'"],
       baseUri:        ["'self'"],
-      formAction:     ["'self'"],
+      formAction:     ["'none'"],
       upgradeInsecureRequests: [],
     },
     reportOnly: false, // ← set to true only when testing; false enforces the policy
