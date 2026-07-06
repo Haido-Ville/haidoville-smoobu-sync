@@ -1,6 +1,13 @@
 // ============================================================
-// HAIDOVILLE × SMOOBU SYNC - Render.com Server v4.1
+// HAIDOVILLE × SMOOBU SYNC - Render.com Server v4.2
 // ============================================================
+// v4.2 CHANGES (on top of v4.1):
+// - UPGRADE: Smoobu API auth switched from simple Api-Key header
+//            to HMAC-SHA256 signed requests. Every outgoing call
+//            now includes X-API-Key, X-Timestamp, X-Nonce, and
+//            X-Signature. Uses SMOOBU_API_LABEL + SMOOBU_API_SECRET
+//            environment variables.
+//
 // v4.1 CHANGES (on top of v4.0):
 // - FIX: Double startup rotation so JWT_SECRET is never present
 //        in JWT_PREV_SEC after boot. Both CURR and PREV are now
@@ -83,7 +90,8 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3000;
 
 // ---- Config ----
-const SMOOBU_API_KEY = process.env.SMOOBU_API_KEY;
+const SMOOBU_API_LABEL = process.env.SMOOBU_API_LABEL;
+const SMOOBU_API_SECRET = process.env.SMOOBU_API_SECRET;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "";
 const FROM_EMAIL = process.env.FROM_EMAIL || "onboarding@resend.dev";
@@ -106,12 +114,60 @@ function rotateJwtKeys() {
   JWT_CURR_SEC = crypto.randomBytes(32).toString('hex');
   console.log(`[JWT] Keys rotated at ${new Date().toISOString()}. Previous key retired, new key generated.`);
 }
-// FIX: Rotate TWICE on startup so JWT_SECRET is flushed from both
-// CURR and PREV. After two rotations both are random — JWT_SECRET
-// is never used as a verification key from the very first request.
+
 rotateJwtKeys();
 rotateJwtKeys();
 setInterval(rotateJwtKeys, JWT_ROTATE_MS);
+
+// ============================================================
+// SMOOBU HMAC-SIGNED FETCH HELPER
+// ============================================================
+
+async function smoobuFetch(url, options = {}) {
+  if (!SMOOBU_API_LABEL || !SMOOBU_API_SECRET) {
+    throw new Error("SMOOBU_API_LABEL or SMOOBU_API_SECRET not configured");
+  }
+
+  const method = (options.method || "GET").toUpperCase();
+  const parsedUrl = new URL(url);
+  const pathname = parsedUrl.pathname;
+
+  // Sort query params alphabetically
+  const sortedParams = [...parsedUrl.searchParams.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([k, v]) => `${k}=${v}`)
+    .join("&");
+
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const nonce = uuidv4();
+
+  // Hash the body (empty string hash for GET/no-body requests)
+  const bodyStr = options.body || "";
+  const bodyHash = crypto.createHash("sha256").update(bodyStr).digest("hex");
+
+  // Build canonical string
+  const canonical = `${method}\n${pathname}\n${sortedParams}\n${timestamp}\n${nonce}\n${bodyHash}\n${SMOOBU_API_LABEL}`;
+
+  // Compute HMAC-SHA256 signature
+  const signature = crypto
+    .createHmac("sha256", SMOOBU_API_SECRET)
+    .update(canonical)
+    .digest("base64");
+
+  // Merge headers
+  const headers = {
+    ...options.headers,
+    "X-API-Key": SMOOBU_API_LABEL,
+    "X-Timestamp": timestamp,
+    "X-Nonce": nonce,
+    "X-Signature": signature,
+  };
+
+  // Remove old Api-Key header if present
+  delete headers["Api-Key"];
+
+  return fetch(url, { ...options, method, headers });
+}
 
 // ============================================================
 // PERSISTENT REFERENCE NUMBER STORE (Dedup)
@@ -446,13 +502,13 @@ app.post("/internal/rotate-jwt", requireApiKey, (req, res) => {
 app.get("/", requireApiKey, (req, res) => {
   res.json({
     service: "HaidoVille Smoobu Sync",
-    version: "4.1",
+    version: "4.2",
     status: "online",
     features: {
-      smoobuSync: !!SMOOBU_API_KEY,
+      smoobuSync: !!SMOOBU_API_LABEL && !!SMOOBU_API_SECRET,
       email: !!RESEND_API_KEY && !!ADMIN_EMAIL,
       ghlWebhook: !!GHL_WEBHOOK_URL,
-      smoobuDraft: CREATE_SMOOBU_DRAFT && !!SMOOBU_API_KEY,
+      smoobuDraft: CREATE_SMOOBU_DRAFT && !!SMOOBU_API_LABEL,
     },
     endpoints: {
       ping: "GET /ping",
@@ -471,11 +527,11 @@ app.get("/", requireApiKey, (req, res) => {
 // GET /apartments-list
 // ============================================================
 app.get("/apartments-list", requireApiKey, async (req, res) => {
-  if (!SMOOBU_API_KEY)
-    return res.status(500).json({ error: "SMOOBU_API_KEY not configured" });
+  if (!SMOOBU_API_LABEL || !SMOOBU_API_SECRET)
+    return res.status(500).json({ error: "Smoobu API credentials not configured" });
   try {
-    const response = await fetch("https://login.smoobu.com/api/apartments", {
-      headers: { "Api-Key": SMOOBU_API_KEY, "Cache-Control": "no-cache" },
+    const response = await smoobuFetch("https://login.smoobu.com/api/apartments", {
+      headers: { "Cache-Control": "no-cache" },
     });
     if (!response.ok) {
       const errText = await response.text();
@@ -502,8 +558,8 @@ app.get("/apartments-list", requireApiKey, async (req, res) => {
 // GET /bookings (protected calendar sync — internal/admin use)
 // ============================================================
 app.get("/bookings", requireCalendarAccess, async (req, res) => {
-  if (!SMOOBU_API_KEY)
-    return res.status(500).json({ error: "SMOOBU_API_KEY not configured" });
+  if (!SMOOBU_API_LABEL || !SMOOBU_API_SECRET)
+    return res.status(500).json({ error: "Smoobu API credentials not configured" });
 
   const nocache = req.query.nocache === "1";
   const now = Date.now();
@@ -546,8 +602,8 @@ app.get("/bookings", requireCalendarAccess, async (req, res) => {
       url.searchParams.set("page", String(page));
       url.searchParams.set("excludeBlocked", "false");
 
-      const smoobuRes = await fetch(url.toString(), {
-        headers: { "Api-Key": SMOOBU_API_KEY, "Cache-Control": "no-cache" },
+      const smoobuRes = await smoobuFetch(url.toString(), {
+        headers: { "Cache-Control": "no-cache" },
       });
 
       if (!smoobuRes.ok) {
@@ -714,8 +770,8 @@ app.get("/availability", availabilityRateLimiter, requireValidSessionHint, async
     return res.json(cache.data);
   }
 
-  if (!SMOOBU_API_KEY)
-    return res.status(500).json({ error: "SMOOBU_API_KEY not configured" });
+  if (!SMOOBU_API_LABEL || !SMOOBU_API_SECRET)
+    return res.status(500).json({ error: "Smoobu API credentials not configured" });
 
   try {
     const today = new Date().toISOString().slice(0, 10);
@@ -734,8 +790,8 @@ app.get("/availability", availabilityRateLimiter, requireValidSessionHint, async
       url.searchParams.set("page", String(page));
       url.searchParams.set("excludeBlocked", "false");
 
-      const smoobuRes = await fetch(url.toString(), {
-        headers: { "Api-Key": SMOOBU_API_KEY, "Cache-Control": "no-cache" },
+      const smoobuRes = await smoobuFetch(url.toString(), {
+        headers: { "Cache-Control": "no-cache" },
       });
       if (!smoobuRes.ok)
         return res.status(smoobuRes.status).json({ error: "Smoobu error" });
@@ -903,7 +959,7 @@ app.post(
         return { ...room, subtotal: calculatedSubtotal };
       });
 
-      if (SMOOBU_API_KEY) {
+      if (SMOOBU_API_LABEL && SMOOBU_API_SECRET) {
         for (const room of sanitizedRooms) {
           if (room.name === "Bunk Beds") {
             const bedsNeeded = parseInt(room.pax) || 1;
@@ -993,7 +1049,7 @@ app.post(
         sendBookingEmail(data).catch((err) => console.error("[Email Error]", err.message));
       }
 
-      if (CREATE_SMOOBU_DRAFT && SMOOBU_API_KEY) {
+      if (CREATE_SMOOBU_DRAFT && SMOOBU_API_LABEL && SMOOBU_API_SECRET) {
         createSmoobuDraft(data)
           .then(() => { cache = { data: null, timestamp: 0 }; })
           .catch((err) => console.error("[Smoobu Draft Error]", err.message));
@@ -1080,8 +1136,8 @@ async function checkNonBunkAvailability(apartmentId, checkIn, checkOut) {
     url.searchParams.set("pageSize", "100");
     url.searchParams.set("excludeBlocked", "false");
 
-    const response = await fetch(url.toString(), {
-      headers: { "Api-Key": SMOOBU_API_KEY, "Cache-Control": "no-cache" },
+    const response = await smoobuFetch(url.toString(), {
+      headers: { "Cache-Control": "no-cache" },
     });
 
     if (!response.ok) {
@@ -1111,7 +1167,7 @@ async function checkNonBunkAvailability(apartmentId, checkIn, checkOut) {
 // HELPER: Find available Bunk apartments
 // ============================================================
 async function findAvailableBunkApartments(checkIn, checkOut) {
-  if (!SMOOBU_API_KEY) return [];
+  if (!SMOOBU_API_LABEL || !SMOOBU_API_SECRET) return [];
 
   try {
     const url = new URL("https://login.smoobu.com/api/reservations");
@@ -1120,8 +1176,8 @@ async function findAvailableBunkApartments(checkIn, checkOut) {
     url.searchParams.set("pageSize", "100");
     url.searchParams.set("excludeBlocked", "false");
 
-    const response = await fetch(url.toString(), {
-      headers: { "Api-Key": SMOOBU_API_KEY, "Cache-Control": "no-cache" },
+    const response = await smoobuFetch(url.toString(), {
+      headers: { "Cache-Control": "no-cache" },
     });
 
     if (!response.ok) {
@@ -1155,7 +1211,7 @@ async function findAvailableBunkApartments(checkIn, checkOut) {
 // HELPER: Create Smoobu Draft Booking
 // ============================================================
 async function createSmoobuDraft(data) {
-  if (!CREATE_SMOOBU_DRAFT || !SMOOBU_API_KEY) return;
+  if (!CREATE_SMOOBU_DRAFT || !SMOOBU_API_LABEL || !SMOOBU_API_SECRET) return;
 
   for (const room of data.rooms) {
     const isBunk = room.name === "Bunk Beds";
@@ -1208,9 +1264,9 @@ async function createSmoobuDraft(data) {
       };
 
       try {
-        const response = await fetch("https://login.smoobu.com/api/reservations", {
+        const response = await smoobuFetch("https://login.smoobu.com/api/reservations", {
           method: "POST",
-          headers: { "Api-Key": SMOOBU_API_KEY, "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
         const result = await response.json();
@@ -1429,7 +1485,7 @@ function buildGhlPayload(data) {
 // ============================================================
 app.listen(PORT, () => {
   console.log(`🚀 Secure HaidoVille Smoobu Sync running on port ${PORT}`);
-  console.log(`   Smoobu API:    ${SMOOBU_API_KEY ? "✅" : "❌"}`);
+  console.log(`   Smoobu HMAC:   ${SMOOBU_API_LABEL && SMOOBU_API_SECRET ? "✅" : "❌"}`);
   console.log(`   Email:         ${RESEND_API_KEY && ADMIN_EMAIL ? "✅" : "⚠️  disabled"}`);
   console.log(`   GHL Webhook:   ${GHL_WEBHOOK_URL ? "✅" : "⚠️  not configured"}`);
   console.log(`   Smoobu Drafts: ${CREATE_SMOOBU_DRAFT ? "✅ ON" : "❌ OFF"}`);
