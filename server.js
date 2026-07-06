@@ -696,8 +696,7 @@ const requireSessionHint = (req, res, next) => {
       return res.status(401).json({ error: "Session expired, reload the page" });
     }
     const currentUa = req.headers["user-agent"] || "unknown";
-    const currentSubnet = extractSubnet(req.ip);
-    if (session.userAgent !== currentUa || session.subnet !== currentSubnet) {
+    if (session.userAgent !== currentUa) {
       sessionTokens.delete(hint);
       return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
     }
