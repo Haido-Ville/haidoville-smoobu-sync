@@ -334,6 +334,8 @@ app.use((req, res, next) => {
     "https://haidoville.com",
     "https://app.haidoville.com",
     "https://www.haidoville.com",
+    "http://127.0.0.1:5500",
+    "http://localhost:5500"
   ];
   if (allowedOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
@@ -727,7 +729,9 @@ app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
   const allowedOrigins = [
     "https://haidoville.com",
     "https://app.haidoville.com",
-    "https://www.haidoville.com"
+    "https://www.haidoville.com",
+    "http://127.0.0.1:5500",
+    "http://localhost:5500"
   ];
   if (!allowedOrigins.includes(origin)) {
     return res.status(403).json({ error: "Unauthorized" });
