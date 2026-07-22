@@ -168,8 +168,9 @@ router.get(
 // ============================================================
 // POST /app/upload — Upload a file to GHL Media
 // ============================================================
-// The frontend sends the compressed image as multipart/form-data.
-// We forward it to GHL with the server-side API key.
+// The frontend sends the compressed image as a raw binary stream
+// (application/octet-stream). We rebuild the FormData on the
+// server so we can securely inject the parentId.
 // ============================================================
 router.post(
   "/upload",
@@ -182,36 +183,35 @@ router.post(
 
     try {
       const folderId = await resolveFolderId();
+      const fileName = req.headers["x-file-name"] || `guest_${Date.now()}.jpg`;
 
-      // Read the raw body as a buffer to forward to GHL
-      const contentType = req.headers["content-type"] || "";
-      if (!contentType.includes("multipart/form-data")) {
-        return res.status(400).json({ error: "Expected multipart/form-data." });
-      }
-
-      // Stream the entire request body to GHL
-      const uploadUrl = GHL_UPLOAD_URL + "?altType=location&altId=" + GHL_MEDIA_LOCATION_ID;
-
-      // We need to reconstruct the FormData for GHL.
-      // Since express doesn't parse multipart by default, we'll
-      // pipe the raw request body directly to GHL.
-      const headers = {
-        ...ghlHeaders(),
-        "content-type": contentType,
-      };
-      // Remove content-length as it may differ after proxying
-      delete headers["content-length"];
-
+      // Read raw binary body
       const chunks = [];
       for await (const chunk of req) {
         chunks.push(chunk);
       }
-      const body = Buffer.concat(chunks);
+      const fileBuffer = Buffer.concat(chunks);
+
+      if (fileBuffer.length === 0) {
+        return res.status(400).json({ error: "Empty file payload." });
+      }
+
+      // Build a clean FormData for GHL
+      const formData = new FormData();
+      formData.append("file", new Blob([fileBuffer]), fileName);
+      formData.append("hosted", "false");
+      formData.append("fileUrl", "");
+      formData.append("name", fileName);
+      if (folderId) {
+        formData.append("parentId", folderId);
+      }
+
+      const uploadUrl = GHL_UPLOAD_URL + "?altType=location&altId=" + GHL_MEDIA_LOCATION_ID;
 
       const ghlRes = await fetch(uploadUrl, {
         method: "POST",
-        headers,
-        body,
+        headers: ghlHeaders(), // fetch automatically sets multipart boundary headers
+        body: formData,
       });
 
       if (!ghlRes.ok) {
@@ -221,7 +221,7 @@ router.post(
       }
 
       const result = await ghlRes.json();
-      console.log("[App/GHL] Upload success:", result.id || result._id || "unknown");
+      console.log("[App/GHL] Upload success:", result.id || result._id || "unknown", "in folder:", folderId);
       res.json({ success: true, fileId: result.id || result._id });
     } catch (err) {
       console.error("[App/GHL] Upload exception:", err.message);
