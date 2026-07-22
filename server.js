@@ -32,6 +32,7 @@ import {
   generateHint,
   verifyHint,
 } from "./encryption.js";
+import appServerRouter, { setSessionHintMiddleware } from "./appServer.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -713,6 +714,10 @@ const requireSessionHint = (req, res, next) => {
     return res.status(403).json({ error: "Unauthorized" });
   }
 };
+
+// Initialize App Server Router middleware
+setSessionHintMiddleware(requireSessionHint);
+app.use("/app", appServerRouter);
 
 // ============================================================
 // GET /api/session-hint — Issues a signed hint per page-load
