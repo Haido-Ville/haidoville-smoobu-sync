@@ -282,7 +282,9 @@ router.post(
       // 3. Search GHL using API v2
       const searchBody = {
         locationId: locationId,
-        query: email
+        query: email,
+        page: 1,
+        pageLimit: 20
       };
 
       const ghlRes = await fetch("https://services.leadconnectorhq.com/contacts/search", {
