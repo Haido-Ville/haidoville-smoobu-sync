@@ -250,7 +250,8 @@ router.post(
     if (allowedOriginsEnv && origin) {
       const allowedOrigins = allowedOriginsEnv.split(',').map(o => o.trim());
       if (!allowedOrigins.includes(origin)) {
-        return res.status(403).json({ access: false });
+        console.error("[App/GHL] CORS blocked origin:", origin);
+        return res.status(403).json({ access: false, debug: "CORS blocked" });
       }
     }
 
@@ -260,7 +261,7 @@ router.post(
     
     if (!apiKey || !locationId) {
       console.error("[App/GHL] GHL_CONTACTS_API_KEY or location ID not configured.");
-      return res.status(500).json({ access: false }); // Fail closed
+      return res.status(500).json({ access: false, debug: "Missing env vars" });
     }
 
     const { firstName, email } = req.body;
@@ -268,7 +269,7 @@ router.post(
     // Validate email format
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!email || !emailRegex.test(email)) {
-      return res.status(400).json({ access: false }); // Reject malformed
+      return res.status(400).json({ access: false, debug: "Invalid email format" });
     }
 
     // Comma-separated allowed tags or default
@@ -295,8 +296,9 @@ router.post(
       });
 
       if (!ghlRes.ok) {
-        console.error("[App/GHL] Contact lookup failed:", ghlRes.status);
-        return res.status(403).json({ access: false }); // Fail closed
+        const errorText = await ghlRes.text();
+        console.error("[App/GHL] Contact lookup failed:", ghlRes.status, errorText);
+        return res.status(502).json({ access: false, debug: "GHL API Error: " + ghlRes.status }); 
       }
 
       const data = await ghlRes.json();
