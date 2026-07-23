@@ -230,4 +230,115 @@ router.post(
   }
 );
 
+// ============================================================
+// POST /app/guest-access — Verify guest login via GHL tags (API v2)
+// ============================================================
+router.post(
+  "/guest-access",
+  rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 20,                  // limit each IP to 20 requests per windowMs
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { access: false }, // Generic fail for rate limit
+  }),
+  requireSession,
+  async (req, res) => {
+    // 1. CORS restriction (if ALLOWED_ORIGIN is set)
+    const allowedOrigin = process.env.ALLOWED_ORIGIN;
+    const origin = req.headers.origin;
+    if (allowedOrigin && origin && origin !== allowedOrigin) {
+      return res.status(403).json({ access: false });
+    }
+
+    // 2. Keys & Configuration
+    const apiKey = process.env.GHL_CONTACTS_API_KEY;
+    const locationId = process.env.GHL_MEDIA_LOCATION_ID || process.env.GHL_LOCATION_ID;
+    
+    if (!apiKey || !locationId) {
+      console.error("[App/GHL] GHL_CONTACTS_API_KEY or location ID not configured.");
+      return res.status(500).json({ access: false }); // Fail closed
+    }
+
+    const { firstName, email } = req.body;
+    
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!email || !emailRegex.test(email)) {
+      return res.status(400).json({ access: false }); // Reject malformed
+    }
+
+    // Comma-separated allowed tags or default
+    const tagsEnv = process.env.ACCESS_TAGS;
+    const ALLOWED_TAGS = tagsEnv 
+      ? tagsEnv.split(',').map(t => t.trim().toLowerCase())
+      : ['direct', 'newreservation', 'agoda', 'upsell-ready', 'airbnb', 'booking.com', 'vrbo', 'website', 'updatereservation', 'hv-booked', 'fully-paid'];
+
+    try {
+      // 3. Search GHL using API v2
+      const searchBody = {
+        locationId: locationId,
+        query: email
+      };
+
+      const ghlRes = await fetch("https://services.leadconnectorhq.com/contacts/search", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Version": "2021-07-28",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(searchBody)
+      });
+
+      if (!ghlRes.ok) {
+        console.error("[App/GHL] Contact lookup failed:", ghlRes.status);
+        return res.status(403).json({ access: false }); // Fail closed
+      }
+
+      const data = await ghlRes.json();
+      const contacts = data.contacts || [];
+
+      if (contacts.length > 0) {
+        // Take the first matching contact (most relevant by email)
+        const contact = contacts[0];
+        const contactTags = (contact.tags || []).map(t => t.toLowerCase());
+        
+        // 4. Check tags
+        const hasAccess = contactTags.some(tag => ALLOWED_TAGS.includes(tag));
+
+        if (hasAccess) {
+          console.log(`[App/GHL] Access granted for: ${email}`);
+          
+          // Optional: Fire automation webhook in background if configured
+          const webhookUrl = process.env.GHL_GUEST_PORTAL_WEBHOOK_URL;
+          if (webhookUrl) {
+             fetch(webhookUrl, {
+               method: 'POST',
+               headers: { 'Content-Type': 'application/json' },
+               body: JSON.stringify({
+                 first_name: firstName || contact.firstName || '',
+                 email: email,
+                 source: 'Mini App Gate',
+                 tag: 'guest-portal-access'
+               })
+             }).catch(err => console.error("[App/GHL] Background webhook failed:", err.message));
+          }
+
+          // 5. Respond success (never leak why it was approved vs denied)
+          return res.json({ access: true, firstName: contact.firstName || firstName });
+        }
+      }
+
+      // If no contact found or no valid tags
+      console.warn(`[App/GHL] Access denied for: ${email} (No valid tags or not found)`);
+      return res.json({ access: false }); // Fail securely (never leak existence)
+
+    } catch (err) {
+      console.error("[App/GHL] Guest verification exception:", err.message);
+      return res.status(500).json({ access: false }); // Fail closed securely
+    }
+  }
+);
+
 export default router;
