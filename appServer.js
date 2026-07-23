@@ -264,11 +264,11 @@ router.post(
     }
 
     const { firstName, email } = req.body;
-    
-    // Validate email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!email || !emailRegex.test(email)) {
-      return res.status(400).json({ access: false, debug: "Invalid email format" });
+    const cleanEmail = (email || '').trim().toLowerCase();
+    const cleanName = (firstName || '').trim().toLowerCase();
+
+    if (!cleanEmail && !cleanName) {
+      return res.status(400).json({ access: false, debug: "First name or email required" });
     }
 
     // Comma-separated allowed tags or default
@@ -277,72 +277,100 @@ router.post(
       ? tagsEnv.split(',').map(t => t.trim().toLowerCase())
       : ['direct', 'newreservation', 'agoda', 'upsell-ready', 'airbnb', 'booking.com', 'vrbo', 'website', 'updatereservation', 'hv-booked', 'fully-paid'];
 
-    try {
-      // 3. Search GHL using API v2
-      const searchBody = {
-        locationId: locationId,
-        query: email,
-        page: 1,
-        pageLimit: 20
-      };
-
-      const ghlRes = await fetch("https://services.leadconnectorhq.com/contacts/search", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Version": "2021-07-28",
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(searchBody)
-      });
-
-      if (!ghlRes.ok) {
-        const errorText = await ghlRes.text();
-        console.error("[App/GHL] Contact lookup failed:", ghlRes.status, errorText);
-        return res.status(502).json({ access: false, debug: "GHL API Error: " + ghlRes.status }); 
+    // Helper: Search GHL
+    async function searchGhlContacts(queryStr) {
+      if (!queryStr) return [];
+      try {
+        const res = await fetch("https://services.leadconnectorhq.com/contacts/search", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "Version": "2021-07-28",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            locationId: locationId,
+            query: queryStr,
+            page: 1,
+            pageLimit: 20
+          })
+        });
+        if (!res.ok) {
+          const errText = await res.text();
+          console.error("[App/GHL] Search HTTP error:", res.status, errText);
+          return [];
+        }
+        const data = await res.json();
+        return data.contacts || [];
+      } catch (err) {
+        console.error("[App/GHL] Search fetch error:", err.message);
+        return [];
       }
+    }
 
-      const data = await ghlRes.json();
-      const contacts = data.contacts || [];
+    try {
+      let matchedContact = null;
 
-      if (contacts.length > 0) {
-        // Take the first matching contact (most relevant by email)
-        const contact = contacts[0];
-        const contactTags = (contact.tags || []).map(t => t.toLowerCase());
-        
-        // 4. Check tags
-        const hasAccess = contactTags.some(tag => ALLOWED_TAGS.includes(tag));
-
-        if (hasAccess) {
-          console.log(`[App/GHL] Access granted for: ${email}`);
-          
-          // Optional: Fire automation webhook in background if configured
-          const webhookUrl = process.env.GHL_GUEST_PORTAL_WEBHOOK_URL;
-          if (webhookUrl) {
-             fetch(webhookUrl, {
-               method: 'POST',
-               headers: { 'Content-Type': 'application/json' },
-               body: JSON.stringify({
-                 first_name: firstName || contact.firstName || '',
-                 email: email,
-                 source: 'Mini App Gate',
-                 tag: 'guest-portal-access'
-               })
-             }).catch(err => console.error("[App/GHL] Background webhook failed:", err.message));
+      // 1. Try search by Email (if provided)
+      if (cleanEmail) {
+        const emailContacts = await searchGhlContacts(cleanEmail);
+        for (const contact of emailContacts) {
+          const cTags = (contact.tags || []).map(t => t.toLowerCase());
+          if (cTags.some(t => ALLOWED_TAGS.includes(t))) {
+            matchedContact = contact;
+            console.log(`[App/GHL] Access granted via EMAIL & TAG for: ${cleanEmail}`);
+            break;
           }
-
-          // 5. Respond success (never leak why it was approved vs denied)
-          return res.json({ access: true, firstName: contact.firstName || firstName });
         }
       }
 
-      // If no contact found or no valid tags
-      console.warn(`[App/GHL] Access denied for: ${email} (No valid tags or not found)`);
-      return res.json({ access: false }); // Fail securely (never leak existence)
+      // 2. If not matched by email, try search by First Name (if provided)
+      if (!matchedContact && cleanName) {
+        const nameContacts = await searchGhlContacts(cleanName);
+        for (const contact of nameContacts) {
+          const cTags = (contact.tags || []).map(t => t.toLowerCase());
+          const cFirstName = (contact.firstName || '').trim().toLowerCase();
+          const cFullName = (contact.name || '').trim().toLowerCase();
+
+          const hasTag = cTags.some(t => ALLOWED_TAGS.includes(t));
+          const nameMatches = (cFirstName && (cFirstName.includes(cleanName) || cleanName.includes(cFirstName))) ||
+                              (cFullName && (cFullName.includes(cleanName) || cleanName.includes(cFullName)));
+
+          if (hasTag && nameMatches) {
+            matchedContact = contact;
+            console.log(`[App/GHL] Access granted via FIRST NAME & TAG for: ${cleanName}`);
+            break;
+          }
+        }
+      }
+
+      // 3. Evaluate Result
+      if (matchedContact) {
+        // Optional: Fire automation webhook in background if configured
+        const webhookUrl = process.env.GHL_GUEST_PORTAL_WEBHOOK_URL;
+        if (webhookUrl) {
+          fetch(webhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              first_name: matchedContact.firstName || firstName || '',
+              email: matchedContact.email || email || '',
+              source: 'Mini App Gate',
+              tag: 'guest-portal-access'
+            })
+          }).catch(err => console.error("[App/GHL] Background webhook failed:", err.message));
+        }
+
+        return res.json({ access: true, firstName: matchedContact.firstName || firstName });
+      }
+
+      // If no matching contact with valid tag found
+      console.warn(`[App/GHL] Access denied for submission: Name="${firstName}", Email="${email}" (No valid tags found)`);
+      return res.json({ access: false });
 
     } catch (err) {
       console.error("[App/GHL] Guest verification exception:", err.message);
-      return res.status(500).json({ access: false }); // Fail closed securely
+      return res.status(500).json({ access: false });
     }
   }
 );
