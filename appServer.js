@@ -245,10 +245,13 @@ router.post(
   requireSession,
   async (req, res) => {
     // 1. CORS restriction (if ALLOWED_ORIGIN is set)
-    const allowedOrigin = process.env.ALLOWED_ORIGIN;
+    const allowedOriginsEnv = process.env.ALLOWED_ORIGIN;
     const origin = req.headers.origin;
-    if (allowedOrigin && origin && origin !== allowedOrigin) {
-      return res.status(403).json({ access: false });
+    if (allowedOriginsEnv && origin) {
+      const allowedOrigins = allowedOriginsEnv.split(',').map(o => o.trim());
+      if (!allowedOrigins.includes(origin)) {
+        return res.status(403).json({ access: false });
+      }
     }
 
     // 2. Keys & Configuration
