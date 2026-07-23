@@ -242,7 +242,6 @@ router.post(
     legacyHeaders: false,
     message: { access: false }, // Generic fail for rate limit
   }),
-  requireSession,
   async (req, res) => {
     // 1. CORS restriction (if ALLOWED_ORIGIN is set)
     const allowedOriginsEnv = process.env.ALLOWED_ORIGIN;
