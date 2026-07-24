@@ -335,7 +335,8 @@ app.use((req, res, next) => {
     "https://app.haidoville.com",
     "https://www.haidoville.com",
     "http://127.0.0.1:5500",
-    "http://localhost:5500"
+    "http://localhost:5500",
+    "https://sites.leadconnectorhq.com"
   ];
   if (allowedOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
