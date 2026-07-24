@@ -329,16 +329,20 @@ app.use(express.json({ limit: "1mb" }));
 
 // Strict CORS
 app.use((req, res, next) => {
-  const origin = req.headers.origin || "";
+  const origin = (req.headers.origin || "").replace(/\/$/, ""); // Remove trailing slash if present
   const allowedOrigins = [
     "https://haidoville.com",
     "https://app.haidoville.com",
     "https://www.haidoville.com",
     "http://127.0.0.1:5500",
     "http://localhost:5500",
-    "https://sites.leadconnectorhq.com"
+    "https://sites.leadconnectorhq.com",
+    "https://app.gohighlevel.com"
   ];
-  if (allowedOrigins.includes(origin)) {
+
+  const isAllowed = allowedOrigins.includes(origin) || origin.endsWith(".leadconnectorhq.com");
+
+  if (isAllowed) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader(

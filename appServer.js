@@ -245,10 +245,12 @@ router.post(
   async (req, res) => {
     // 1. CORS restriction (if ALLOWED_ORIGIN is set)
     const allowedOriginsEnv = process.env.ALLOWED_ORIGIN;
-    const origin = req.headers.origin;
+    const origin = (req.headers.origin || "").replace(/\/$/, "");
     if (allowedOriginsEnv && origin) {
       const allowedOrigins = allowedOriginsEnv.split(',').map(o => o.trim());
-      if (!allowedOrigins.includes(origin)) {
+      const isTrustedGhl = origin.endsWith(".leadconnectorhq.com") || origin.endsWith(".gohighlevel.com");
+      
+      if (!allowedOrigins.includes(origin) && !isTrustedGhl) {
         console.error("[App/GHL] CORS blocked origin:", origin);
         return res.status(403).json({ access: false, debug: "CORS blocked" });
       }
