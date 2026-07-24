@@ -248,7 +248,7 @@ router.post(
     const origin = (req.headers.origin || "").replace(/\/$/, "");
     if (allowedOriginsEnv && origin) {
       const allowedOrigins = allowedOriginsEnv.split(',').map(o => o.trim());
-      const isTrustedGhl = origin.endsWith(".leadconnectorhq.com") || origin.endsWith(".gohighlevel.com");
+      const isTrustedGhl = origin.endsWith(".leadconnectorhq.com") || origin.endsWith(".gohighlevel.com") || origin.endsWith(".msgsndr.com");
       
       if (!allowedOrigins.includes(origin) && !isTrustedGhl) {
         console.error("[App/GHL] CORS blocked origin:", origin);

@@ -340,7 +340,7 @@ app.use((req, res, next) => {
     "https://app.gohighlevel.com"
   ];
 
-  const isAllowed = allowedOrigins.includes(origin) || origin.endsWith(".leadconnectorhq.com");
+  const isAllowed = allowedOrigins.includes(origin) || origin.endsWith(".leadconnectorhq.com") || origin.endsWith(".msgsndr.com") || origin.endsWith(".gohighlevel.com");
 
   if (isAllowed) {
     res.setHeader("Access-Control-Allow-Origin", origin);
@@ -741,8 +741,9 @@ app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
     "https://app.gohighlevel.com"
   ];
   
-  const isAllowed = allowedOrigins.includes(origin) || origin.endsWith(".leadconnectorhq.com");
+  const isAllowed = allowedOrigins.includes(origin) || origin.endsWith(".leadconnectorhq.com") || origin.endsWith(".msgsndr.com") || origin.endsWith(".gohighlevel.com");
   if (!isAllowed) {
+    console.error("[session-hint] Blocked origin:", origin);
     return res.status(403).json({ error: "Unauthorized" });
   }
   try {
