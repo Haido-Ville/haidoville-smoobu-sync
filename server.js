@@ -730,15 +730,19 @@ app.use("/app", appServerRouter);
 // GET /api/session-hint — Issues a signed hint per page-load
 // ============================================================
 app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
-  const origin = req.headers.origin || "";
+  const origin = (req.headers.origin || "").replace(/\/$/, "");
   const allowedOrigins = [
     "https://haidoville.com",
     "https://app.haidoville.com",
     "https://www.haidoville.com",
     "http://127.0.0.1:5500",
-    "http://localhost:5500"
+    "http://localhost:5500",
+    "https://sites.leadconnectorhq.com",
+    "https://app.gohighlevel.com"
   ];
-  if (!allowedOrigins.includes(origin)) {
+  
+  const isAllowed = allowedOrigins.includes(origin) || origin.endsWith(".leadconnectorhq.com");
+  if (!isAllowed) {
     return res.status(403).json({ error: "Unauthorized" });
   }
   try {
