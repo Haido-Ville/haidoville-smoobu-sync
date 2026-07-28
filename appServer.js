@@ -8,6 +8,8 @@
 
 import express from "express";
 import rateLimit from "express-rate-limit";
+import crypto from "crypto";
+import { v4 as uuidv4 } from "uuid";
 
 const router = express.Router();
 
@@ -231,7 +233,102 @@ router.post(
 );
 
 // ============================================================
-// POST /app/guest-access — Verify guest login via GHL tags (API v2)
+// SMOOBU HMAC FETCH HELPER (mirrors server.js logic)
+// ============================================================
+const SMOOBU_API_LABEL  = process.env.SMOOBU_API_LABEL;
+const SMOOBU_API_SECRET = process.env.SMOOBU_API_SECRET;
+
+async function smoobuFetch(url, options = {}) {
+  if (!SMOOBU_API_LABEL || !SMOOBU_API_SECRET) {
+    throw new Error("SMOOBU_API_LABEL or SMOOBU_API_SECRET not configured");
+  }
+
+  const method = (options.method || "GET").toUpperCase();
+  const parsed = new URL(url);
+  const pathname = parsed.pathname;
+
+  // Sort query params alphabetically
+  const params = [...parsed.searchParams.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([k, v]) => `${k}=${v}`)
+    .join("&");
+
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const nonce = uuidv4();
+
+  const bodyStr = options.body || "";
+  const bodyHash = crypto.createHash("sha256").update(bodyStr).digest("hex");
+
+  const canonical = `${method}\n${pathname}\n${params}\n${timestamp}\n${nonce}\n${bodyHash}\n${SMOOBU_API_LABEL}`;
+
+  const signature = crypto
+    .createHmac("sha256", SMOOBU_API_SECRET)
+    .update(canonical)
+    .digest("base64");
+
+  const headers = {
+    ...options.headers,
+    "X-API-Key": SMOOBU_API_LABEL,
+    "X-Timestamp": timestamp,
+    "X-Nonce": nonce,
+    "X-Signature": signature,
+  };
+
+  delete headers["Api-Key"];
+
+  return fetch(url, { ...options, method, headers });
+}
+
+// ============================================================
+// SMOOBU RESERVATION CACHE (60-second TTL)
+// ============================================================
+let _reservationCache = null;
+let _reservationCacheTs = 0;
+const RESERVATION_CACHE_TTL_MS = 60 * 1000; // 60 seconds
+
+async function fetchAllBookedReservations() {
+  const now = Date.now();
+  if (_reservationCache && now - _reservationCacheTs < RESERVATION_CACHE_TTL_MS) {
+    return _reservationCache;
+  }
+
+  const allBookings = [];
+  let currentPage = 1;
+  let totalPages = 1;
+
+  while (currentPage <= totalPages) {
+    const url = `https://login.smoobu.com/api/reservations?showCancellation=false&pageSize=100&page=${currentPage}`;
+    const res = await smoobuFetch(url);
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`[App/Smoobu] Reservations API error (page ${currentPage}):`, res.status, errText);
+      break;
+    }
+
+    const data = await res.json();
+    const bookings = data.bookings || [];
+    allBookings.push(...bookings);
+
+    totalPages = data.page_count || 1;
+    currentPage++;
+  }
+
+  // Filter: only real guest reservations (not cancellations, not calendar blocks)
+  const filtered = allBookings.filter(b =>
+    b.type === "reservation" &&
+    b["is-blocked-booking"] === false
+  );
+
+  _reservationCache = filtered;
+  _reservationCacheTs = now;
+
+  console.log(`[App/Smoobu] Cached ${filtered.length} active reservations (from ${allBookings.length} total across ${totalPages} page(s))`);
+  return filtered;
+}
+
+// ============================================================
+// POST /app/guest-access — Verify guest via Smoobu bookings
 // ============================================================
 router.post(
   "/guest-access",
@@ -251,18 +348,15 @@ router.post(
       const isTrustedGhl = origin.endsWith(".leadconnectorhq.com") || origin.endsWith(".gohighlevel.com") || origin.endsWith(".msgsndr.com");
       
       if (!allowedOrigins.includes(origin) && !isTrustedGhl) {
-        console.error("[App/GHL] CORS blocked origin:", origin);
-        return res.status(403).json({ access: false, debug: "CORS blocked" });
+        console.error("[App/Smoobu] CORS blocked origin:", origin);
+        return res.status(403).json({ access: false });
       }
     }
 
-    // 2. Keys & Configuration
-    const apiKey = process.env.GHL_CONTACTS_API_KEY;
-    const locationId = process.env.GHL_MEDIA_LOCATION_ID || process.env.GHL_LOCATION_ID;
-    
-    if (!apiKey || !locationId) {
-      console.error("[App/GHL] GHL_CONTACTS_API_KEY or location ID not configured.");
-      return res.status(500).json({ access: false, debug: "Missing env vars" });
+    // 2. Validate Smoobu credentials
+    if (!SMOOBU_API_LABEL || !SMOOBU_API_SECRET) {
+      console.error("[App/Smoobu] SMOOBU_API_LABEL or SMOOBU_API_SECRET not configured.");
+      return res.status(500).json({ access: false });
     }
 
     const { firstName, email } = req.body;
@@ -270,84 +364,42 @@ router.post(
     const cleanName = (firstName || '').trim().toLowerCase();
 
     if (!cleanEmail && !cleanName) {
-      return res.status(400).json({ access: false, debug: "First name or email required" });
-    }
-
-    // Comma-separated allowed tags or default
-    const tagsEnv = process.env.ACCESS_TAGS;
-    const ALLOWED_TAGS = tagsEnv 
-      ? tagsEnv.split(',').map(t => t.trim().toLowerCase())
-      : ['direct', 'newreservation', 'agoda', 'upsell-ready', 'airbnb', 'booking.com', 'vrbo', 'website', 'updatereservation', 'hv-booked', 'fully-paid'];
-
-    // Helper: Search GHL
-    async function searchGhlContacts(queryStr) {
-      if (!queryStr) return [];
-      try {
-        const res = await fetch("https://services.leadconnectorhq.com/contacts/search", {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${apiKey}`,
-            "Version": "2021-07-28",
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            locationId: locationId,
-            query: queryStr,
-            page: 1,
-            pageLimit: 20
-          })
-        });
-        if (!res.ok) {
-          const errText = await res.text();
-          console.error("[App/GHL] Search HTTP error:", res.status, errText);
-          return [];
-        }
-        const data = await res.json();
-        return data.contacts || [];
-      } catch (err) {
-        console.error("[App/GHL] Search fetch error:", err.message);
-        return [];
-      }
+      return res.status(400).json({ access: false });
     }
 
     try {
-      let matchedContact = null;
+      const reservations = await fetchAllBookedReservations();
+      let matchedBooking = null;
 
-      // 1. Try search by Email (if provided)
+      // 1. Try match by email first (case-insensitive, trimmed)
       if (cleanEmail) {
-        const emailContacts = await searchGhlContacts(cleanEmail);
-        for (const contact of emailContacts) {
-          const cTags = (contact.tags || []).map(t => t.toLowerCase());
-          if (cTags.some(t => ALLOWED_TAGS.includes(t))) {
-            matchedContact = contact;
-            console.log(`[App/GHL] Access granted via EMAIL & TAG for: ${cleanEmail}`);
-            break;
-          }
+        matchedBooking = reservations.find(b => {
+          const bEmail = (b.email || '').trim().toLowerCase();
+          return bEmail && bEmail === cleanEmail;
+        });
+        if (matchedBooking) {
+          console.log(`[App/Smoobu] Access granted via EMAIL for: ${cleanEmail}`);
         }
       }
 
-      // 2. If not matched by email, try search by First Name (if provided)
-      if (!matchedContact && cleanName) {
-        const nameContacts = await searchGhlContacts(cleanName);
-        for (const contact of nameContacts) {
-          const cTags = (contact.tags || []).map(t => t.toLowerCase());
-          const cFirstName = (contact.firstName || '').trim().toLowerCase();
-          const cFullName = (contact.name || '').trim().toLowerCase();
-
-          const hasTag = cTags.some(t => ALLOWED_TAGS.includes(t));
-          const nameMatches = (cFirstName && (cFirstName.includes(cleanName) || cleanName.includes(cFirstName))) ||
-                              (cFullName && (cFullName.includes(cleanName) || cleanName.includes(cFullName)));
-
-          if (hasTag && nameMatches) {
-            matchedContact = contact;
-            console.log(`[App/GHL] Access granted via FIRST NAME & TAG for: ${cleanName}`);
-            break;
-          }
+      // 2. Fallback: fuzzy match by guest name (substring either direction)
+      if (!matchedBooking && cleanName) {
+        matchedBooking = reservations.find(b => {
+          const guestName = (b["guest-name"] || '').trim().toLowerCase();
+          if (!guestName) return false;
+          return guestName.includes(cleanName) || cleanName.includes(guestName);
+        });
+        if (matchedBooking) {
+          console.log(`[App/Smoobu] Access granted via NAME for: ${cleanName}`);
         }
       }
 
-      // 3. Evaluate Result
-      if (matchedContact) {
+      // 3. Evaluate result
+      if (matchedBooking) {
+        // Extract first name from guest-name (take the first word)
+        const guestFullName = matchedBooking["guest-name"] || '';
+        const resolvedFirstName = guestFullName.split(/\s+/)[0] || firstName || '';
+
         // Optional: Fire automation webhook in background if configured
         const webhookUrl = process.env.GHL_GUEST_PORTAL_WEBHOOK_URL;
         if (webhookUrl) {
@@ -355,23 +407,28 @@ router.post(
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              first_name: matchedContact.firstName || firstName || '',
-              email: matchedContact.email || email || '',
+              first_name: resolvedFirstName,
+              email: matchedBooking.email || email || '',
               source: 'Mini App Gate',
               tag: 'guest-portal-access'
             })
-          }).catch(err => console.error("[App/GHL] Background webhook failed:", err.message));
+          }).catch(err => console.error("[App/Smoobu] Background webhook failed:", err.message));
         }
 
-        return res.json({ access: true, firstName: matchedContact.firstName || firstName });
+        return res.json({
+          access: true,
+          firstName: resolvedFirstName,
+          bookingId: matchedBooking.id,
+          guestAppUrl: matchedBooking["guest-app-url"] || null,
+        });
       }
 
-      // If no matching contact with valid tag found
-      console.warn(`[App/GHL] Access denied for submission: Name="${firstName}", Email="${email}" (No valid tags found)`);
+      // No match found
+      console.warn(`[App/Smoobu] Access denied for: Name="${firstName}", Email="${email}"`);
       return res.json({ access: false });
 
     } catch (err) {
-      console.error("[App/GHL] Guest verification exception:", err.message);
+      console.error("[App/Smoobu] Guest verification exception:", err.message);
       return res.status(500).json({ access: false });
     }
   }
