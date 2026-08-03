@@ -885,8 +885,8 @@ app.get("/booking-token", tokenRateLimiter, requireSessionHint, (req, res) => {
 let bookingMutex = Promise.resolve();
 app.post(
   "/bookings/create",
-  requireJwtToken,
   requireSessionHint,
+  requireJwtToken,
   requireFreshTimestamp,
   bookingRateLimiter,
   async (req, res) => {
