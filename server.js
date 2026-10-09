@@ -1220,10 +1220,21 @@ function buildGhlPayload(data) {
   const grandTotal = data.payment.grandTotal || 0;
   const dpAmount = data.payment.amount;
   const balance = grandTotal - dpAmount;
-  let roomType = firstRoom.name || "";
-  if (data.rooms.length > 1) roomType = data.rooms.map((r) => r.name).join(" + ");
+  // Multi-room stays can have different dates: the email shows the whole stay
+  // (earliest check-in to latest check-out), and each room's own dates when they differ.
+  const stayIn = data.rooms.map((r) => r.checkIn).sort()[0];
+  const stayOut = data.rooms.map((r) => r.checkOut).sort().at(-1);
+  const sameDates = data.rooms.every((r) => r.checkIn === stayIn && r.checkOut === stayOut);
+  const fmtRange = (ci, co) => {
+    const [a, b] = [fmtShortDate(ci), fmtShortDate(co)]; // "Jun 17, 2027"
+    const [am, ad] = a.split(/[ ,]+/), [bm, bd] = b.split(/[ ,]+/);
+    return am === bm ? `${am} ${ad}–${bd}` : `${am} ${ad} – ${bm} ${bd}`;
+  };
+  const roomType = sameDates
+    ? data.rooms.map((r) => r.name).join(" + ")
+    : data.rooms.map((r) => `${r.name} (${fmtRange(r.checkIn, r.checkOut)})`).join(" + ");
   const totalPax = data.rooms.reduce((sum, r) => sum + (parseInt(r.pax) || 0), 0);
-  const totalNights = Math.max(...data.rooms.map((r) => parseInt(r.nights) || 0));
+  const totalNights = Math.round((new Date(stayOut + "T00:00:00Z") - new Date(stayIn + "T00:00:00Z")) / 86400000);
 
   return {
     source: data.source || "Website (Direct)",
@@ -1241,8 +1252,8 @@ function buildGhlPayload(data) {
     nationality: data.guest.nationality || "",
     complete_address: data.guest.address || "",
     room_type: roomType,
-    check_in_date: fmtShortDate(firstRoom.checkIn),
-    check_out_date: fmtShortDate(firstRoom.checkOut),
+    check_in_date: fmtShortDate(stayIn),
+    check_out_date: fmtShortDate(stayOut),
     arrival_time: fmtTime12(data.guest.arrivalTime),
     departure_time: fmtTime12(data.guest.departureTime),
     port_of_arrival: data.guest.port || "",
@@ -1282,7 +1293,7 @@ app.use((err, req, res, next) => {
 
 export {
   app, calculateRoomPrice, isValidDate, getEaster, isHolyWeekDate, buildAvailabilityResult,
-  seedRefsFromSmoobu, sendBookingEmail,
+  seedRefsFromSmoobu, sendBookingEmail, buildGhlPayload,
 };
 
 // Listen only when run directly (`node server.js`), not when imported by tests.
