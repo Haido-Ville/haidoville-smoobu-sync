@@ -1,26 +1,24 @@
 // ============================================================
-// HAIDOVILLE × SMOOBU SYNC - Render.com Server v4.2
+// HAIDOVILLE × SMOOBU SYNC - Render.com Server v4.3
 // ============================================================
-// v4.2 CHANGES (on top of v4.1):
-// - UPGRADE: Smoobu API auth switched from simple Api-Key header
-//            to HMAC-SHA256 signed requests. Every outgoing call
-//            now includes X-API-Key, X-Timestamp, X-Nonce, and
-//            X-Signature. Uses SMOOBU_API_LABEL + SMOOBU_API_SECRET
-//            environment variables.
+// v4.3 CHANGES (security audit 2026-09-29):
+// - Rate limits keyed on the real client IP (CF-Connecting-IP).
+// - Booking lock covers the availability check + Smoobu draft,
+//   so two guests can't book the same room at once.
+// - Payment references normalised, time-based dedup, restored
+//   from Smoobu draft notices on startup.
+// - Stricter validation (reference numbers, inquiries), bounded
+//   in-memory stores, generic error responses, JSON error handler,
+//   no guest PII in logs, [SEC] security event logs.
 //
-// v4.1 CHANGES (on top of v4.0):
-// - FIX: Double startup rotation so JWT_SECRET is never present
-//        in JWT_PREV_SEC after boot. Both CURR and PREV are now
-//        fresh random keys from the first request onward.
-// - FIX: /bookings query params (from/to) now validated with
-//        the same isValidDate() used in /bookings/create.
+// v4.2: Smoobu API auth uses HMAC-SHA256 signed requests
+//       (SMOOBU_API_LABEL + SMOOBU_API_SECRET).
 // ============================================================
 
 import express from "express";
-import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 import { Resend } from "resend";
-import "dotenv/config"; 
+import "dotenv/config";
 
 import path from "path";
 import fs from "fs";
@@ -28,10 +26,8 @@ import { fileURLToPath } from "url";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
-import {
-  generateHint,
-  verifyHint,
-} from "./encryption.js";
+import { generateHint, verifyHint, HINT_TTL_MS } from "./encryption.js";
+import { limiter, secLog, safeEqual, smoobuFetch, fetchReservations, recordBooking, securityStatus } from "./shared.js";
 import appServerRouter, { setSessionHintMiddleware } from "./appServer.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -39,7 +35,6 @@ const app = express();
 app.set("trust proxy", 1);
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
-
   contentSecurityPolicy: {
     useDefaults: false, // take full control
     directives: {
@@ -55,37 +50,18 @@ app.use(helmet({
       formAction:     ["'none'"],
       upgradeInsecureRequests: [],
     },
-    reportOnly: false, // ← set to true only when testing; false enforces the policy
+    reportOnly: false,
   },
-
-  // X-XSS-Protection
   xssFilter: true,
-
-  // X-Content-Type-Options
   noSniff: true,
-
-  // X-Frame-Options
   frameguard: { action: "sameorigin" },
-
-  // Strict-Transport-Security
   hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
-
-  // Referrer-Policy
   referrerPolicy: { policy: "strict-origin-when-cross-origin" },
 }));
 
-// Permissions-Policy — must be added manually, helmet doesn't set this header
+// Permissions-Policy — helmet doesn't set this header
 app.use((req, res, next) => {
-  res.setHeader(
-    "Permissions-Policy",
-    [
-      "accelerometer=()",
-      "gyroscope=()",
-      "magnetometer=()",
-      "microphone=()",
-      "usb=()",
-    ].join(", ")
-  );
+  res.setHeader("Permissions-Policy", "accelerometer=(), gyroscope=(), magnetometer=(), microphone=(), usb=()");
   next();
 });
 const PORT = process.env.PORT || 3000;
@@ -104,105 +80,80 @@ const CREATE_SMOOBU_DRAFT = process.env.CREATE_SMOOBU_DRAFT === "true";
 // ---- Secure Configuration Keys ----
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
 const CALENDAR_ACCESS_TOKEN = process.env.CALENDAR_ACCESS_TOKEN;
-const JWT_SECRET = process.env.JWT_SECRET;
-let JWT_CURR_SEC = JWT_SECRET;
-let JWT_PREV_SEC = JWT_SECRET;
+// JWT signing keys are random per process and rotated; nothing is read from env.
+let JWT_CURR_SEC, JWT_PREV_SEC;
 const JWT_EXPIRATION = process.env.JWT_EXPIRATION || "90s";
 const JWT_ROTATE_MS = process.env.JWT_ROTATE_MS ? parseInt(process.env.JWT_ROTATE_MS, 10) : 12 * 60 * 60 * 1000;
 
 function rotateJwtKeys() {
   JWT_PREV_SEC = JWT_CURR_SEC;
-  JWT_CURR_SEC = crypto.randomBytes(32).toString('hex');
-  console.log(`[JWT] Keys rotated at ${new Date().toISOString()}. Previous key retired, new key generated.`);
+  JWT_CURR_SEC = crypto.randomBytes(32).toString("hex");
+  console.log(`[JWT] Keys rotated at ${new Date().toISOString()}.`);
 }
 
 rotateJwtKeys();
 rotateJwtKeys();
-setInterval(rotateJwtKeys, JWT_ROTATE_MS);
+setInterval(rotateJwtKeys, JWT_ROTATE_MS).unref();
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const isoDay = (offsetDays) => new Date(Date.now() + offsetDays * 86400000).toISOString().slice(0, 10);
 
 // ============================================================
-// SMOOBU HMAC-SIGNED FETCH HELPER
+// PAYMENT REFERENCE STORE (Dedup)
 // ============================================================
-
-async function smoobuFetch(url, options = {}) {
-  if (!SMOOBU_API_LABEL || !SMOOBU_API_SECRET) {
-    throw new Error("SMOOBU_API_LABEL or SMOOBU_API_SECRET not configured");
-  }
-
-  const method = (options.method || "GET").toUpperCase();
-  const parsedUrl = new URL(url);
-  const pathname = parsedUrl.pathname;
-
-  // Sort query params alphabetically
-  const sortedParams = [...parsedUrl.searchParams.entries()]
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([k, v]) => `${k}=${v}`)
-    .join("&");
-
-  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
-  const nonce = uuidv4();
-
-  // Hash the body (empty string hash for GET/no-body requests)
-  const bodyStr = options.body || "";
-  const bodyHash = crypto.createHash("sha256").update(bodyStr).digest("hex");
-
-  // Build canonical string
-  const canonical = `${method}\n${pathname}\n${sortedParams}\n${timestamp}\n${nonce}\n${bodyHash}\n${SMOOBU_API_LABEL}`;
-
-  // Compute HMAC-SHA256 signature
-  const signature = crypto
-    .createHmac("sha256", SMOOBU_API_SECRET)
-    .update(canonical)
-    .digest("base64");
-
-  // Merge headers
-  const headers = {
-    ...options.headers,
-    "X-API-Key": SMOOBU_API_LABEL,
-    "X-Timestamp": timestamp,
-    "X-Nonce": nonce,
-    "X-Signature": signature,
-  };
-
-  // Remove old Api-Key header if present
-  delete headers["Api-Key"];
-
-  return fetch(url, { ...options, method, headers });
-}
-
-// ============================================================
-// PERSISTENT REFERENCE NUMBER STORE (Dedup)
-// ============================================================
-const REF_FILE = path.join(__dirname, "data", "processed_refs.json");
-let processedReferenceNumbers = new Set();
+// Render's disk is wiped on every deploy/restart/spin-down, so the file only
+// covers the current uptime. seedRefsFromSmoobu() restores references from
+// Smoobu draft notices on startup (needs CREATE_SMOOBU_DRAFT=true).
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
+const REF_FILE = path.join(DATA_DIR, "processed_refs.json");
+const REF_TTL_MS = 180 * 24 * 60 * 60 * 1000;
+const processedRefs = new Map(); // normalised ref -> first seen (ms)
 
 try {
   if (fs.existsSync(REF_FILE)) {
-    const data = JSON.parse(fs.readFileSync(REF_FILE, "utf8"));
-    processedReferenceNumbers = new Set(data);
+    for (const e of JSON.parse(fs.readFileSync(REF_FILE, "utf8"))) {
+      const [ref, ts] = Array.isArray(e) ? e : [e, Date.now()]; // old format: plain strings
+      processedRefs.set(normalizeRef(ref), ts);
+    }
   } else {
-    fs.mkdirSync(path.join(__dirname, "data"), { recursive: true });
-    fs.writeFileSync(REF_FILE, JSON.stringify([]));
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(REF_FILE, "[]");
   }
 } catch (e) {
   console.error("Error loading reference numbers:", e.message);
 }
 
-async function isRefAlreadyUsed(refNum) {
-  return processedReferenceNumbers.has(refNum);
+// "abc 12-3" and "ABC12-3" are the same receipt.
+function normalizeRef(ref) {
+  return String(ref || "").replace(/\s+/g, "").toUpperCase();
 }
 
-async function markRefAsUsed(refNum) {
-  processedReferenceNumbers.add(refNum);
-  if (processedReferenceNumbers.size > 10000) {
-    const it = processedReferenceNumbers.values();
-    processedReferenceNumbers.delete(it.next().value);
-  }
+function isRefAlreadyUsed(ref) {
+  return processedRefs.has(ref);
+}
+
+function markRefAsUsed(ref) {
+  const now = Date.now();
+  processedRefs.set(ref, now);
+  // Expire by age, not count, so flooding fake refs can't evict real ones.
+  for (const [r, ts] of processedRefs) if (now - ts > REF_TTL_MS) processedRefs.delete(r);
   try {
-    fs.writeFileSync(REF_FILE, JSON.stringify([...processedReferenceNumbers]));
-  } catch(e) {
+    fs.writeFileSync(REF_FILE, JSON.stringify([...processedRefs]));
+  } catch (e) {
     console.error("Error saving reference numbers:", e.message);
   }
+}
+
+async function seedRefsFromSmoobu() {
+  if (!SMOOBU_API_LABEL || !SMOOBU_API_SECRET) return 0;
+  let added = 0;
+  for (const b of await fetchReservations(isoDay(-180), isoDay(365))) {
+    const m = /Ref: ([^\s|]+)/.exec(b.notice || "");
+    if (!m || m[1].startsWith("CASH-")) continue;
+    const ref = normalizeRef(m[1]);
+    if (!processedRefs.has(ref)) { processedRefs.set(ref, Date.now()); added++; }
+  }
+  return added;
 }
 
 // ---- Holy Week Date Helper ----
@@ -231,22 +182,19 @@ function isHolyWeekDate(date) {
   return diffDays >= 0 && diffDays <= 7;
 }
 
-// ---- Shared date validation helper (used in /bookings and /bookings/create) ----
+// ---- Shared date validation helper ----
 const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 function isValidDate(str) {
   if (!DATE_REGEX.test(str)) return false;
-  const d = new Date(str + 'T00:00:00');
+  const d = new Date(str + "T00:00:00Z"); // UTC, so the round-trip below works in any server timezone
   return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === str;
 }
 
 // ---- Booking ID generator ----
-async function generateUniqueBookingId() {
+function generateUniqueBookingId() {
   const now = new Date();
-  const yymm =
-    String(now.getFullYear()).slice(-2) +
-    String(now.getMonth() + 1).padStart(2, "0");
-  const uniquePart = uuidv4().split('-')[0].toUpperCase();
-  return `HV-${yymm}-${uniquePart}`;
+  const yymm = String(now.getFullYear()).slice(-2) + String(now.getMonth() + 1).padStart(2, "0");
+  return `HV-${yymm}-${uuidv4().split("-")[0].toUpperCase()}`;
 }
 
 // ---- Server-Side Pricing Function ----
@@ -303,51 +251,49 @@ const APARTMENT_MAP = {
   3261777: { roomId: "bunk", beds: 1 },
 };
 
-const ROOM_NAME_TO_APT_ID = {
-  "Barkada Room": 3261782,
-  "Couple Room": 3261742,
-  "Family Room 1": 3261662,
-  "Family Room 2": 3261737,
-  "Bunk Beds": [3261752, 3261757, 3261762, 3261767, 3261772, 3261777],
-};
-
 const NON_BUNK_ROOM_APT_IDS = {
   "Barkada Room": 3261782,
   "Couple Room": 3261742,
   "Family Room 1": 3261662,
   "Family Room 2": 3261737,
 };
-
-const BUNK_APARTMENT_IDS = ROOM_NAME_TO_APT_ID["Bunk Beds"];
+const BUNK_APARTMENT_IDS = [3261752, 3261757, 3261762, 3261767, 3261772, 3261777];
+const VALID_ROOM_NAMES = [...Object.keys(NON_BUNK_ROOM_APT_IDS), "Bunk Beds"];
 
 // ---- Cache & In-Memory Booking Log ----
 let cache = { data: null, timestamp: 0 };
-const pendingBookings = [];
+const pendingBookings = []; // last 7 days, capped
+const MAX_PENDING_BOOKINGS = 1000;
 
 // ---- Middleware ----
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "100kb" }));
 
 // Strict CORS
+const ALLOWED_ORIGINS = [
+  "https://haidoville.com",
+  "https://app.haidoville.com",
+  "https://www.haidoville.com",
+  // Local development against the live API (the frontend hard-codes the Render URL).
+  "http://127.0.0.1:5500",
+  "http://localhost:5500",
+  "https://sites.leadconnectorhq.com",
+  "https://app.gohighlevel.com",
+];
+// GHL serves sites, previews and the guest app from these shared domains.
+const isAllowedOrigin = (origin) =>
+  ALLOWED_ORIGINS.includes(origin) ||
+  origin.endsWith(".leadconnectorhq.com") || origin.endsWith(".msgsndr.com") || origin.endsWith(".gohighlevel.com");
+
 app.use((req, res, next) => {
-  const origin = (req.headers.origin || "").replace(/\/$/, ""); // Remove trailing slash if present
-  const allowedOrigins = [
-    "https://haidoville.com",
-    "https://app.haidoville.com",
-    "https://www.haidoville.com",
-    "http://127.0.0.1:5500",
-    "http://localhost:5500",
-    "https://sites.leadconnectorhq.com",
-    "https://app.gohighlevel.com"
-  ];
-
-  const isAllowed = allowedOrigins.includes(origin) || origin.endsWith(".leadconnectorhq.com") || origin.endsWith(".msgsndr.com") || origin.endsWith(".gohighlevel.com");
-
-  if (isAllowed) {
+  const origin = (req.headers.origin || "").replace(/\/$/, "");
+  res.setHeader("Vary", "Origin");
+  if (isAllowedOrigin(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader(
       "Access-Control-Allow-Headers",
-      "Content-Type, X-API-Key, X-Calendar-Access, Authorization, X-Session-Hint, X-Timestamp, X-File-Name"
+      // X-Timestamp is still sent by the booking modal; it is no longer checked.
+      "Content-Type, X-API-Key, X-Calendar-Access, Authorization, X-Session-Hint, X-Guest-Pass, X-Timestamp, X-File-Name"
     );
   } else {
     res.setHeader("Access-Control-Allow-Origin", "https://haidoville.com");
@@ -356,34 +302,21 @@ app.use((req, res, next) => {
   next();
 });
 
+const adminLimiter = limiter(60 * 1000, 30);
+
+// No key at all is crawler/scanner noise; a wrong key is someone guessing.
 const requireApiKey = (req, res, next) => {
-  const clientKey = req.headers["x-api-key"];
-  if (!clientKey || clientKey !== INTERNAL_API_KEY) {
+  if (!safeEqual(req.headers["x-api-key"], INTERNAL_API_KEY)) {
+    secLog(req, req.headers["x-api-key"] ? "bad internal API key" : "internal endpoint without key");
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
 };
 
 const requireCalendarAccess = (req, res, next) => {
-  const calToken = req.headers["x-calendar-access"];
-  if (!calToken || calToken !== CALENDAR_ACCESS_TOKEN) {
+  if (!safeEqual(req.headers["x-calendar-access"], CALENDAR_ACCESS_TOKEN)) {
+    secLog(req, req.headers["x-calendar-access"] ? "bad calendar access token" : "internal endpoint without key");
     return res.status(403).json({ error: "Unauthorized" });
-  }
-  next();
-};
-
-// ============================================================
-// TIMESTAMP DRIFT MIDDLEWARE (Replay Attack Prevention)
-// ============================================================
-const MAX_TIMESTAMP_DRIFT_MS = 5 * 60 * 1000;
-
-const requireFreshTimestamp = (req, res, next) => {
-  const raw = req.headers["x-timestamp"];
-  if (!raw) return res.status(400).json({ error: "Unauthorized" });
-  const incoming = parseInt(raw, 10);
-  if (isNaN(incoming)) return res.status(400).json({ error: "Unauthorized" });
-  if (Math.abs(Date.now() - incoming) > MAX_TIMESTAMP_DRIFT_MS) {
-    return res.status(400).json({ error: "Unauthorized" });
   }
   next();
 };
@@ -391,7 +324,7 @@ const requireFreshTimestamp = (req, res, next) => {
 // ============================================================
 // ONE-TIME USE JWT VALIDATION (persisted to disk)
 // ============================================================
-const USED_TOKENS_FILE = path.join(__dirname, "data", "used_tokens.json");
+const USED_TOKENS_FILE = path.join(DATA_DIR, "used_tokens.json");
 const usedTokens = new Map();
 
 try {
@@ -401,7 +334,6 @@ try {
     for (const [jti, exp] of stored) {
       if (now < exp) usedTokens.set(jti, exp);
     }
-    console.log(`[JWT] Loaded ${usedTokens.size} unexpired JTIs from disk.`);
   }
 } catch (e) {
   console.error("[JWT] Error loading used tokens:", e.message);
@@ -410,12 +342,8 @@ try {
 function persistUsedTokens() {
   try {
     const now = Date.now();
-    const entries = [];
-    for (const [jti, exp] of usedTokens) {
-      if (now < exp) entries.push([jti, exp]);
-      else usedTokens.delete(jti);
-    }
-    fs.writeFileSync(USED_TOKENS_FILE, JSON.stringify(entries));
+    for (const [jti, exp] of usedTokens) if (now >= exp) usedTokens.delete(jti);
+    fs.writeFileSync(USED_TOKENS_FILE, JSON.stringify([...usedTokens]));
   } catch (e) {
     console.error("[JWT] Error persisting used tokens:", e.message);
   }
@@ -428,17 +356,15 @@ const requireJwtToken = (req, res, next) => {
   }
   const token = authHeader.split(" ")[1];
   let decoded;
-  try {
-    decoded = jwt.verify(token, JWT_CURR_SEC);
-  } catch (e1) {
-    try {
-      decoded = jwt.verify(token, JWT_PREV_SEC);
-    } catch (e2) {
-      return res.status(403).json({ error: "Invalid or expired token." });
-    }
+  for (const key of [JWT_CURR_SEC, JWT_PREV_SEC]) {
+    try { decoded = jwt.verify(token, key, { algorithms: ["HS256"] }); break; } catch { /* try previous key */ }
   }
-
+  if (!decoded) {
+    secLog(req, "invalid booking token");
+    return res.status(403).json({ error: "Invalid or expired token." });
+  }
   if (usedTokens.has(decoded.jti)) {
+    secLog(req, "booking token reused");
     return res.status(401).json({ error: "Unauthorized" });
   }
   usedTokens.set(decoded.jti, decoded.exp * 1000);
@@ -449,45 +375,11 @@ const requireJwtToken = (req, res, next) => {
 // ============================================================
 // RATE LIMITING
 // ============================================================
-const bookingRateLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many requests. Please wait a moment and try again." },
-});
-
-const tokenRateLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many requests. Please wait a moment and try again." },
-});
-
-const pingRateLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 12,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many requests. Please wait a moment and try again." },
-});
-
-const availabilityRateLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many requests. Please wait a moment and try again." },
-});
-
-const inquiryRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many requests. Please wait a moment and try again." },
-});
+const bookingRateLimiter = limiter(60 * 60 * 1000, 10); // a guest books once or twice; retries included
+const tokenRateLimiter = limiter(60 * 1000, 20);
+const pingRateLimiter = limiter(60 * 1000, 12);
+const availabilityRateLimiter = limiter(60 * 1000, 30);
+const inquiryRateLimiter = limiter(15 * 60 * 1000, 5);
 
 // ============================================================
 // GET /ping — Public keep-alive endpoint (no auth)
@@ -499,18 +391,25 @@ app.get("/ping", pingRateLimiter, (req, res) => {
 // ============================================================
 // POST /internal/rotate-jwt — Manually trigger JWT key rotation
 // ============================================================
-app.post("/internal/rotate-jwt", requireApiKey, (req, res) => {
+app.post("/internal/rotate-jwt", adminLimiter, requireApiKey, (req, res) => {
   rotateJwtKeys();
   res.json({ ok: true, message: "JWT keys rotated successfully." });
 });
 
 // ============================================================
+// GET /internal/security — Attack monitor: flagged IPs, alerts, booking volume
+// ============================================================
+app.get("/internal/security", adminLimiter, requireApiKey, (req, res) => {
+  res.json(securityStatus());
+});
+
+// ============================================================
 // GET / — Protected health check (internal use only)
 // ============================================================
-app.get("/", requireApiKey, (req, res) => {
+app.get("/", adminLimiter, requireApiKey, (req, res) => {
   res.json({
     service: "HaidoVille Smoobu Sync",
-    version: "4.2",
+    version: "4.3",
     status: "online",
     features: {
       smoobuSync: !!SMOOBU_API_LABEL && !!SMOOBU_API_SECRET,
@@ -526,15 +425,15 @@ app.get("/", requireApiKey, (req, res) => {
       apartments: "GET /apartments-list",
       createBooking: "POST /bookings/create",
       inquiry: "POST /inquiry",
+      security: "GET /internal/security",
     },
-
   });
 });
 
 // ============================================================
 // GET /apartments-list
 // ============================================================
-app.get("/apartments-list", requireApiKey, async (req, res) => {
+app.get("/apartments-list", adminLimiter, requireApiKey, async (req, res) => {
   if (!SMOOBU_API_LABEL || !SMOOBU_API_SECRET)
     return res.status(500).json({ error: "Smoobu API credentials not configured" });
   try {
@@ -542,8 +441,8 @@ app.get("/apartments-list", requireApiKey, async (req, res) => {
       headers: { "Cache-Control": "no-cache" },
     });
     if (!response.ok) {
-      const errText = await response.text();
-      return res.status(response.status).json({ error: errText });
+      console.error("[apartments-list] Smoobu", response.status, await response.text());
+      return res.status(502).json({ error: "Smoobu API error" });
     }
     const data = await response.json();
     const apartments = data.apartments || [];
@@ -558,93 +457,55 @@ app.get("/apartments-list", requireApiKey, async (req, res) => {
       sampleMapping,
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("[apartments-list]", err.message);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
 // ============================================================
 // GET /bookings (protected calendar sync — internal/admin use)
 // ============================================================
-app.get("/bookings", requireCalendarAccess, async (req, res) => {
+app.get("/bookings", adminLimiter, requireCalendarAccess, async (req, res) => {
   if (!SMOOBU_API_LABEL || !SMOOBU_API_SECRET)
     return res.status(500).json({ error: "Smoobu API credentials not configured" });
 
   const nocache = req.query.nocache === "1";
+  // A custom range must not read or overwrite the shared cache that /availability serves.
+  const customRange = req.query.from !== undefined || req.query.to !== undefined;
   const now = Date.now();
-  if (!nocache && cache.data && now - cache.timestamp < CACHE_DURATION_MS) {
+  if (!nocache && !customRange && cache.data && now - cache.timestamp < CACHE_DURATION_MS) {
     res.setHeader("X-Cache", "HIT");
-    // X-Cache-Age header removed to prevent server clock leakage
     return res.json(cache.data);
   }
 
+  const rawFrom = typeof req.query.from === "string" ? req.query.from.slice(0, 10) : null;
+  const rawTo   = typeof req.query.to   === "string" ? req.query.to.slice(0, 10)   : null;
+  if (rawFrom && !isValidDate(rawFrom)) {
+    return res.status(400).json({ error: "Invalid 'from' date format. Use YYYY-MM-DD." });
+  }
+  if (rawTo && !isValidDate(rawTo)) {
+    return res.status(400).json({ error: "Invalid 'to' date format. Use YYYY-MM-DD." });
+  }
+
   try {
-    const today = new Date().toISOString().slice(0, 10);
-    const oneYearLater = new Date();
-    oneYearLater.setFullYear(oneYearLater.getFullYear() + 1);
-    const toDate = oneYearLater.toISOString().slice(0, 10);
-
-    // FIX: Validate query param dates before passing to Smoobu
-    const rawFrom = typeof req.query.from === "string" ? req.query.from.slice(0, 10) : null;
-    const rawTo   = typeof req.query.to   === "string" ? req.query.to.slice(0, 10)   : null;
-
-    if (rawFrom && !isValidDate(rawFrom)) {
-      return res.status(400).json({ error: "Invalid 'from' date format. Use YYYY-MM-DD." });
-    }
-    if (rawTo && !isValidDate(rawTo)) {
-      return res.status(400).json({ error: "Invalid 'to' date format. Use YYYY-MM-DD." });
-    }
-
-    const fromDate = rawFrom || today;
-    const endDate  = rawTo   || toDate;
-
-    const allBookings = [];
-    let page = 1;
-    let totalPages = 1;
-    const maxPages = 20;
-
-    do {
-      const url = new URL("https://login.smoobu.com/api/reservations");
-      url.searchParams.set("from", fromDate);
-      url.searchParams.set("to", endDate);
-      url.searchParams.set("pageSize", "100");
-      url.searchParams.set("page", String(page));
-      url.searchParams.set("excludeBlocked", "false");
-
-      const smoobuRes = await smoobuFetch(url.toString(), {
-        headers: { "Cache-Control": "no-cache" },
-      });
-
-      if (!smoobuRes.ok) {
-        const errText = await smoobuRes.text();
-        return res.status(smoobuRes.status).json({
-          error: "Smoobu API error",
-          status: smoobuRes.status,
-          detail: errText,
-        });
-      }
-
-      const data = await smoobuRes.json();
-      if (data.bookings && data.bookings.length)
-        allBookings.push(...data.bookings);
-      totalPages = data.page_count || 1;
-      page++;
-    } while (page <= totalPages && page <= maxPages);
-
-    const result = buildAvailabilityResult(allBookings);
-    cache = { data: result, timestamp: now };
+    const result = buildAvailabilityResult(await fetchReservations(rawFrom || isoDay(0), rawTo || isoDay(365)));
+    if (!customRange) cache = { data: result, timestamp: now };
     res.setHeader("X-Cache", "MISS");
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: "Server error", message: err.message });
+    console.error("[bookings]", err.message);
+    res.status(err.status ? 502 : 500).json({ error: err.status ? "Smoobu API error" : "Server error" });
   }
 });
 
 // ============================================================
-// SESSION TOKENS — capped uses, self-expiring
+// SESSION TOKENS — capped uses, self-expiring, bounded store
 // ============================================================
 const sessionTokens = new Map();
-const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS) || 60 * 60 * 1000;
+// A session can't outlive its signed hint, so cap the TTL at the hint lifetime.
+const SESSION_TTL_MS = Math.min(parseInt(process.env.SESSION_TTL_MS) || HINT_TTL_MS, HINT_TTL_MS);
 const SESSION_MAX_USES = parseInt(process.env.SESSION_MAX_USES) || 50;
+const MAX_SESSIONS = 5000;
 
 function cleanupSessionTokens() {
   const now = Date.now();
@@ -652,77 +513,38 @@ function cleanupSessionTokens() {
     if (now > session.exp || session.usesLeft <= 0) sessionTokens.delete(hint);
   }
 }
+setInterval(cleanupSessionTokens, 60 * 1000).unref();
 
-const requireValidSessionHint = (req, res, next) => {
-  const header = req.headers["x-session-hint"] || "";
-  const parts = header.split(".");
+// consume=true counts against the session's use limit.
+const sessionHint = (consume) => (req, res, next) => {
+  const parts = (req.headers["x-session-hint"] || "").split(".");
   if (parts.length !== 3) return res.status(400).json({ error: "Unauthorized" });
   const [hint, ts, sig] = parts;
   try {
     verifyHint(hint, ts, sig);
-    const session = sessionTokens.get(hint);
-    if (!session) return res.status(401).json({ error: "Session expired, reload the page" });
-    if (Date.now() > session.exp) {
-      sessionTokens.delete(hint);
-      return res.status(401).json({ error: "Session expired, reload the page" });
-    }
-    const currentUa = req.headers["user-agent"] || "unknown";
-    if (session.userAgent !== currentUa) {
-      sessionTokens.delete(hint);
-      return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
-    }
-    req.sessionHint = hint;
-    next();
   } catch (err) {
+    if (err.expired) return res.status(401).json({ error: "Session expired, reload the page" });
+    secLog(req, "bad session hint signature");
     return res.status(403).json({ error: "Unauthorized" });
   }
-};
-
-// Extract subnet from IP for loose-match comparison
-// IPv4: keeps first 3 octets (e.g. 203.0.113.x → 203.0.113)
-// IPv6: keeps first 3 groups (/48) (e.g. 2001:db8:abcd:xxxx → 2001:db8:abcd)
-function extractSubnet(ip) {
-  if (!ip) return "unknown";
-  const cleaned = ip.replace(/^::ffff:/, ""); 
-  if (cleaned.includes(":")) {
-    return cleaned.split(":").slice(0, 3).join(":");
+  const session = sessionTokens.get(hint);
+  if (!session || Date.now() > session.exp || session.usesLeft <= 0) {
+    sessionTokens.delete(hint);
+    return res.status(401).json({ error: "Session expired, reload the page" });
   }
-  return cleaned.split(".").slice(0, 3).join(".");
-}
-
-const requireSessionHint = (req, res, next) => {
-  const header = req.headers["x-session-hint"] || "";
-  const parts = header.split(".");
-  if (parts.length !== 3) return res.status(400).json({ error: "Unauthorized" });
-  const [hint, ts, sig] = parts;
-  try {
-    verifyHint(hint, ts, sig);
-    const session = sessionTokens.get(hint);
-    if (!session) return res.status(401).json({ error: "Session expired, reload the page" });
-    if (Date.now() > session.exp) {
-      sessionTokens.delete(hint);
-      return res.status(401).json({ error: "Session expired, reload the page" });
-    }
-    const currentUa = req.headers["user-agent"] || "unknown";
-    if (session.userAgent !== currentUa) {
-      sessionTokens.delete(hint);
-      return res.status(403).json({ error: "Session context mismatch. Token theft detected." });
-    }
-    if (session.usesLeft <= 0) {
-      sessionTokens.delete(hint);
-      return res.status(401).json({ error: "Session expired, reload the page" });
-    }
-    session.usesLeft -= 1;
-    if (session.usesLeft <= 0) sessionTokens.delete(hint);
-    if (sessionTokens.size > 500) cleanupSessionTokens();
-    req.sessionHint = hint;
-    next();
-  } catch (err) {
+  if (session.userAgent !== (req.headers["user-agent"] || "unknown")) {
+    sessionTokens.delete(hint);
+    secLog(req, "session used from a different user-agent");
     return res.status(403).json({ error: "Unauthorized" });
   }
+  if (consume && --session.usesLeft <= 0) sessionTokens.delete(hint);
+  req.sessionHint = hint;
+  req.hvSession = session; // still valid for this request even if its last use just deleted it
+  next();
 };
+const requireSessionHint = sessionHint(true);
+const requireValidSessionHint = sessionHint(false);
 
-// Initialize App Server Router middleware
 setSessionHintMiddleware(requireSessionHint);
 app.use("/app", appServerRouter);
 
@@ -731,30 +553,21 @@ app.use("/app", appServerRouter);
 // ============================================================
 app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
   const origin = (req.headers.origin || "").replace(/\/$/, "");
-  const allowedOrigins = [
-    "https://haidoville.com",
-    "https://app.haidoville.com",
-    "https://www.haidoville.com",
-    "http://127.0.0.1:5500",
-    "http://localhost:5500",
-    "https://sites.leadconnectorhq.com",
-    "https://app.gohighlevel.com"
-  ];
-  
-  const isAllowed = allowedOrigins.includes(origin) || origin.endsWith(".leadconnectorhq.com") || origin.endsWith(".msgsndr.com") || origin.endsWith(".gohighlevel.com");
-  if (!isAllowed) {
-    console.error("[session-hint] Blocked origin:", origin);
+  if (!isAllowedOrigin(origin)) {
+    secLog(req, "session hint blocked origin");
     return res.status(403).json({ error: "Unauthorized" });
   }
   try {
     const { hint, ts, sig } = generateHint();
     const csrfToken = uuidv4();
+    // Bounded store: evict the oldest; its owner gets a 401 and the frontend fetches a new hint.
+    if (sessionTokens.size >= MAX_SESSIONS) cleanupSessionTokens();
+    if (sessionTokens.size >= MAX_SESSIONS) sessionTokens.delete(sessionTokens.keys().next().value);
     sessionTokens.set(hint, {
       usesLeft: SESSION_MAX_USES,
       exp: Date.now() + SESSION_TTL_MS,
       userAgent: req.headers["user-agent"] || "unknown",
-      subnet: extractSubnet(req.ip),
-      csrfToken: csrfToken
+      csrfToken,
     });
     res.json({ hint: `${hint}.${ts}.${sig}`, csrfToken });
   } catch (err) {
@@ -778,13 +591,12 @@ app.get("/api/payment-methods", tokenRateLimiter, requireSessionHint, (req, res)
 });
 
 // ============================================================
-// GET /availability (public — no auth, no PII)
+// GET /availability (public — no PII)
 // ============================================================
 app.get("/availability", availabilityRateLimiter, requireValidSessionHint, async (req, res) => {
   const now = Date.now();
   if (cache.data && now - cache.timestamp < CACHE_DURATION_MS) {
     res.setHeader("X-Cache", "HIT");
-    // X-Cache-Age header removed to prevent server clock leakage
     return res.json(cache.data);
   }
 
@@ -792,40 +604,13 @@ app.get("/availability", availabilityRateLimiter, requireValidSessionHint, async
     return res.status(500).json({ error: "Smoobu API credentials not configured" });
 
   try {
-    const today = new Date().toISOString().slice(0, 10);
-    const oneYearLater = new Date();
-    oneYearLater.setFullYear(oneYearLater.getFullYear() + 1);
-    const toDate = oneYearLater.toISOString().slice(0, 10);
-
-    const allBookings = [];
-    let page = 1, totalPages = 1;
-
-    do {
-      const url = new URL("https://login.smoobu.com/api/reservations");
-      url.searchParams.set("from", today);
-      url.searchParams.set("to", toDate);
-      url.searchParams.set("pageSize", "100");
-      url.searchParams.set("page", String(page));
-      url.searchParams.set("excludeBlocked", "false");
-
-      const smoobuRes = await smoobuFetch(url.toString(), {
-        headers: { "Cache-Control": "no-cache" },
-      });
-      if (!smoobuRes.ok)
-        return res.status(smoobuRes.status).json({ error: "Smoobu error" });
-
-      const data = await smoobuRes.json();
-      if (data.bookings?.length) allBookings.push(...data.bookings);
-      totalPages = data.page_count || 1;
-      page++;
-    } while (page <= totalPages && page <= 20);
-
-    const result = buildAvailabilityResult(allBookings);
+    const result = buildAvailabilityResult(await fetchReservations(isoDay(0), isoDay(365)));
     cache = { data: result, timestamp: now };
     res.setHeader("X-Cache", "MISS");
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: "Server error" });
+    console.error("[availability]", err.message);
+    res.status(err.status ? 502 : 500).json({ error: err.status ? "Smoobu error" : "Server error" });
   }
 });
 
@@ -836,7 +621,6 @@ function buildAvailabilityResult(allBookings) {
     bunkBookings: [],
     familyBookedUnits: [],
     bunkTotal: BUNK_APARTMENT_IDS.length,
-
     totalBookings: allBookings.length,
   };
 
@@ -871,49 +655,62 @@ function buildAvailabilityResult(allBookings) {
 }
 
 // ============================================================
-// GET /booking-token (public — issues one-time JWT)
+// GET /booking-token (issues one-time JWT)
 // ============================================================
 app.get("/booking-token", tokenRateLimiter, requireSessionHint, (req, res) => {
-  const jti = uuidv4();
-  const token = jwt.sign({ jti }, JWT_CURR_SEC, { expiresIn: JWT_EXPIRATION });
+  const token = jwt.sign({ jti: uuidv4() }, JWT_CURR_SEC, { expiresIn: JWT_EXPIRATION, algorithm: "HS256" });
   res.json({ token });
 });
 
 // ============================================================
 // POST /bookings/create
 // ============================================================
-let bookingMutex = Promise.resolve();
+// Bookings run one at a time, so the availability check and the Smoobu
+// draft that claims the room can't interleave with another booking.
+let bookingQueue = Promise.resolve();
+function withBookingLock(fn) {
+  const run = bookingQueue.then(fn, fn);
+  bookingQueue = run.catch(() => {});
+  return run;
+}
+
+const VALID_CHANNELS = ["gcash", "maya", "metro", "land", "cash"];
+const BOOKING_SOURCES = ["Website (Direct)"];
+const MAX_BOOKINGS_PER_GUEST_PER_DAY = 3;
+const REF_RE = /^[A-Z0-9-]{5,30}$/;
+
 app.post(
   "/bookings/create",
+  bookingRateLimiter,
   requireSessionHint,
   requireJwtToken,
-  requireFreshTimestamp,
-  bookingRateLimiter,
   async (req, res) => {
-    let releaseMutex = null;
     try {
       const rawData = req.body;
 
       if (!rawData || !rawData.bookingId || !rawData.guest || !rawData.rooms || !rawData.payment) {
         return res.status(400).json({ error: "Missing required fields" });
       }
-
       if (!Array.isArray(rawData.rooms) || rawData.rooms.length === 0 || rawData.rooms.length > 5) {
         return res.status(400).json({ error: "Invalid room allocation parameters boundary." });
       }
 
-      const clientRef = String(rawData.payment.referenceNumber || "").trim();
-      if (rawData.payment.channel !== "cash") {
-        if (!clientRef || clientRef.length < 5) {
-          return res.status(400).json({ error: "Unauthorized" });
+      const paymentChannel = String(rawData.payment.channel);
+      if (!VALID_CHANNELS.includes(paymentChannel)) {
+        return res.status(400).json({ error: "Invalid payment channel." });
+      }
+      const isCash = paymentChannel === "cash";
+      const clientRef = normalizeRef(rawData.payment.referenceNumber);
+      if (!isCash) {
+        if (!REF_RE.test(clientRef)) {
+          return res.status(400).json({ error: "Please enter the reference number exactly as shown on your receipt (5–30 letters or numbers)." });
         }
-        if (await isRefAlreadyUsed(clientRef)) {
-          return res.status(409).json({ error: "Unauthorized" });
+        if (isRefAlreadyUsed(clientRef)) {
+          return res.status(409).json({ error: "This reference number was already used for another booking." });
         }
       }
 
       const sanitizeText = (str, maxLen) => String(str || "").replace(/[<>\r\n]/g, "").trim().slice(0, maxLen);
-
       const sanitizedGuest = {
         name: sanitizeText(rawData.guest.name, 80),
         email: sanitizeText(rawData.guest.email, 80),
@@ -926,25 +723,31 @@ app.post(
         port: sanitizeText(rawData.guest.port, 50),
         specialRequest: sanitizeText(rawData.guest.specialRequest, 500),
       };
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(sanitizedGuest.email)) {
+      if (!EMAIL_RE.test(sanitizedGuest.email)) {
         return res.status(400).json({ error: "Invalid email address." });
       }
 
-      const VALID_ROOM_NAMES = Object.keys(ROOM_NAME_TO_APT_ID);
+      const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+      const emailKey = sanitizedGuest.email.toLowerCase();
+      const recentByGuest = pendingBookings.filter((b) =>
+        new Date(b.receivedAt).getTime() > dayAgo && b.guest.email.toLowerCase() === emailKey).length;
+      if (recentByGuest >= MAX_BOOKINGS_PER_GUEST_PER_DAY) {
+        secLog(req, "per-guest daily booking cap");
+        return res.status(429).json({ error: "Too many bookings for this email today. Please message us on Messenger." });
+      }
 
       for (const room of rawData.rooms) {
-        if (!VALID_ROOM_NAMES.includes(String(room.name))) {
+        if (!VALID_ROOM_NAMES.includes(String(room?.name))) {
           return res.status(400).json({ error: "Invalid room name." });
         }
       }
 
-      const todayStr = new Date().toISOString().slice(0, 10);
-
+      const todayStr = isoDay(0);
       const sanitizedRooms = rawData.rooms.map((room) => ({
         name: String(room.name),
         checkIn: String(room.checkIn).slice(0, 10),
         checkOut: String(room.checkOut).slice(0, 10),
-        nights: Math.max(1, Math.min(30, parseInt(room.nights) || 1)),
+        nights: 1,
         pax: Math.max(1, Math.min(9, parseInt(room.pax) || 1)),
         paxLabel: room.name === "Bunk Beds" ? "Beds" : "Guests",
       }));
@@ -959,132 +762,130 @@ app.post(
         if (room.checkOut <= room.checkIn) {
           return res.status(400).json({ error: "Check-out must be after check-in." });
         }
-        const ci = new Date(room.checkIn + 'T00:00:00');
-        const co = new Date(room.checkOut + 'T00:00:00');
-        const stayNights = Math.round((co - ci) / 86400000);
+        const stayNights = Math.round((new Date(room.checkOut + "T00:00:00Z") - new Date(room.checkIn + "T00:00:00Z")) / 86400000);
         if (stayNights < 2) {
-          return res.status(400).json({ error: 'Minimum stay is 2 nights.' });
+          return res.status(400).json({ error: "Minimum stay is 2 nights." });
         }
         room.nights = stayNights;
       }
 
-      let calculatedGrandTotal = 0;
-      const finalProcessedRooms = sanitizedRooms.map((room) => {
-        const calculatedSubtotal = calculateRoomPrice(
-          room.name, room.pax, room.nights, room.checkIn, room.checkOut,
-        );
-        calculatedGrandTotal += calculatedSubtotal;
-        return { ...room, subtotal: calculatedSubtotal };
-      });
-
-      if (SMOOBU_API_LABEL && SMOOBU_API_SECRET) {
-        for (const room of sanitizedRooms) {
-          if (room.name === "Bunk Beds") {
-            const bedsNeeded = parseInt(room.pax) || 1;
-            const freeApts = await findAvailableBunkApartments(room.checkIn, room.checkOut);
-            if (freeApts.length < bedsNeeded) {
-              console.warn(`[Availability] Bunk Beds: need ${bedsNeeded} beds, only ${freeApts.length} free for ${room.checkIn} → ${room.checkOut}.`);
-              return res.status(409).json({
-                error: `Not enough bunk beds available for the selected dates. Only ${freeApts.length} bed${freeApts.length !== 1 ? "s" : ""} left — you requested ${bedsNeeded}. Please adjust your dates or number of beds.`,
-              });
-            }
-            continue;
-          }
-          const aptId = NON_BUNK_ROOM_APT_IDS[room.name];
-          if (!aptId) continue;
-          const isAvailable = await checkNonBunkAvailability(aptId, room.checkIn, room.checkOut);
-          if (!isAvailable) {
-            console.warn(`[Availability] ${room.name} is already booked for ${room.checkIn} → ${room.checkOut}.`);
-            return res.status(409).json({
-              error: `${room.name} is not available for the selected dates. Please choose different dates or a different room.`,
-            });
+      // Same room twice with overlapping dates in one request would double-book it.
+      for (let i = 0; i < sanitizedRooms.length; i++) {
+        for (let j = i + 1; j < sanitizedRooms.length; j++) {
+          const a = sanitizedRooms[i], b = sanitizedRooms[j];
+          if (a.name === b.name && a.checkIn < b.checkOut && b.checkIn < a.checkOut) {
+            return res.status(400).json({ error: `${a.name} is listed twice for overlapping dates.` });
           }
         }
       }
 
-      const VALID_CHANNELS = ["gcash","maya","metro","land","cash"];
-      const paymentChannel = String(rawData.payment.channel);
-      if (!VALID_CHANNELS.includes(paymentChannel)) {
-        return res.status(400).json({ error: "Unauthorized" });
+      let calculatedGrandTotal = 0;
+      let finalProcessedRooms;
+      try {
+        finalProcessedRooms = sanitizedRooms.map((room) => {
+          const subtotal = calculateRoomPrice(room.name, room.pax, room.nights, room.checkIn, room.checkOut);
+          calculatedGrandTotal += subtotal;
+          return { ...room, subtotal };
+        });
+      } catch (e) {
+        return res.status(400).json({ error: e.message }); // pax out of range for the room
       }
-
-      const paymentType = String(rawData.payment.type) === "full" ? "full" : "dp";
-      const finalAmountPaid = paymentType === "full"
-        ? calculatedGrandTotal
-        : Math.ceil(calculatedGrandTotal * 0.5);
 
       // Strict price validation — no tolerance
-      const clientAmount = Number(rawData.payment.amount);
-      const clientGrandTotal = Number(rawData.payment.grandTotal);
-      if (clientAmount !== finalAmountPaid || clientGrandTotal !== calculatedGrandTotal) {
-        return res.status(400).json({ error: "Unauthorized" });
+      if (Number(rawData.payment.grandTotal) !== calculatedGrandTotal) {
+        secLog(req, "booking price mismatch");
+        return res.status(400).json({ error: "Price mismatch. Please refresh the page and try again." });
       }
 
-      const acquired = new Promise(r => releaseMutex = r);
-      const prev = bookingMutex;
-      bookingMutex = acquired;
-      await prev;
-
-      if (paymentChannel !== "cash" && await isRefAlreadyUsed(clientRef)) {
-        return res.status(409).json({ error: "Unauthorized" });
+      // Downpayment: any whole-peso amount from 50% (rounded up) to 100% of the total.
+      // Paying 100% counts as full payment.
+      const minDownpayment = Math.ceil(calculatedGrandTotal * 0.5);
+      const finalAmountPaid = Number(rawData.payment.amount);
+      const wantsFull = String(rawData.payment.type) === "full";
+      if (!Number.isInteger(finalAmountPaid) || finalAmountPaid > calculatedGrandTotal ||
+          finalAmountPaid < (wantsFull ? calculatedGrandTotal : minDownpayment)) {
+        secLog(req, "booking price mismatch");
+        return res.status(400).json({ error: wantsFull
+          ? "Price mismatch. Please refresh the page and try again."
+          : `Downpayment must be a whole amount from ₱${minDownpayment.toLocaleString()} (50%) to ₱${calculatedGrandTotal.toLocaleString()}.` });
       }
+      const paymentType = finalAmountPaid === calculatedGrandTotal ? "full" : "dp";
 
-      const serverBookingId = await generateUniqueBookingId();
+      const source = BOOKING_SOURCES.includes(rawData.source) ? rawData.source : BOOKING_SOURCES[0];
 
-      const data = {
-        bookingId: serverBookingId,
-        source: String(rawData.source || "Website (Direct)").slice(0, 50),
-        submittedAt: rawData.submittedAt || new Date().toISOString(),
-        guest: sanitizedGuest,
-        rooms: finalProcessedRooms,
-        payment: {
-          channel: paymentChannel,
-          type: paymentType,
-          referenceNumber: paymentChannel === "cash" ? `CASH-${Date.now()}` : clientRef,
-          amount: finalAmountPaid,
-          grandTotal: calculatedGrandTotal,
-        },
-      };
+      const outcome = await withBookingLock(async () => {
+        if (!isCash && isRefAlreadyUsed(clientRef)) {
+          return { status: 409, body: { error: "This reference number was already used for another booking." } };
+        }
+        if (SMOOBU_API_LABEL && SMOOBU_API_SECRET) {
+          const unavailable = await findUnavailableRoom(sanitizedRooms);
+          if (unavailable) return { status: 409, body: { error: unavailable } };
+        }
 
-      if (paymentChannel !== "cash") {
-        await markRefAsUsed(clientRef);
+        const data = {
+          bookingId: generateUniqueBookingId(),
+          source,
+          submittedAt: new Date().toISOString(),
+          guest: sanitizedGuest,
+          rooms: finalProcessedRooms,
+          payment: {
+            channel: paymentChannel,
+            type: paymentType,
+            referenceNumber: isCash ? `CASH-${Date.now()}` : clientRef,
+            amount: finalAmountPaid,
+            grandTotal: calculatedGrandTotal,
+            balance: calculatedGrandTotal - finalAmountPaid,
+          },
+        };
+
+        if (!isCash) markRefAsUsed(clientRef);
+        pendingBookings.push({ ...data, receivedAt: data.submittedAt });
+        const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+        while (pendingBookings.length > MAX_PENDING_BOOKINGS ||
+               (pendingBookings.length && new Date(pendingBookings[0].receivedAt).getTime() < weekAgo)) {
+          pendingBookings.shift();
+        }
+
+        // Claim the room in Smoobu before the lock is released.
+        // ponytail: with CREATE_SMOOBU_DRAFT=false nothing claims the room, so two
+        // guests can still both be accepted; staff resolve it manually.
+        if (CREATE_SMOOBU_DRAFT && SMOOBU_API_LABEL && SMOOBU_API_SECRET) {
+          await createSmoobuDraft(data).catch((err) => console.error("[Smoobu Draft Error]", err.message));
+          cache = { data: null, timestamp: 0 };
+        }
+        return { status: 200, data };
+      });
+
+      if (outcome.status !== 200) {
+        console.warn("[Availability]", outcome.body.error);
+        return res.status(outcome.status).json(outcome.body);
       }
-
-      pendingBookings.push({ ...data, receivedAt: new Date().toISOString() });
-
-      const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-      while (pendingBookings.length > 0 && new Date(pendingBookings[0].receivedAt).getTime() < weekAgo) {
-        pendingBookings.shift();
+      const data = outcome.data;
+      // "normal" unless this IP also tripped security events (see shared.js).
+      data.risk = recordBooking(req);
+      console.log("[Booking Received]", data.bookingId, "source:", data.source, "risk:", data.risk.level);
+      if (data.risk.level === "attack") {
+        console.error("[ALERT] Booking", data.bookingId, "came from an IP flagged as an attack. Verify the receipt before confirming. |",
+          JSON.stringify(data.risk.reasons));
       }
-
-      console.log("[Booking Received]", data.bookingId, "-", data.guest.name, "(", data.guest.email, ") source:", data.source);
 
       if (GHL_WEBHOOK_URL) {
         forwardToGHL(data).catch((err) => console.error("[GHL Webhook Error]", err.message));
       }
-
       if (RESEND_API_KEY && ADMIN_EMAIL) {
         sendBookingEmail(data).catch((err) => console.error("[Email Error]", err.message));
-      }
-
-      if (CREATE_SMOOBU_DRAFT && SMOOBU_API_LABEL && SMOOBU_API_SECRET) {
-        createSmoobuDraft(data)
-          .then(() => { cache = { data: null, timestamp: 0 }; })
-          .catch((err) => console.error("[Smoobu Draft Error]", err.message));
       }
 
       res.json({
         success: true,
         bookingId: data.bookingId,
-        message: paymentChannel === "cash"
+        message: isCash
           ? "Booking confirmed! Please pay in cash upon arrival."
           : "Booking reserved. Please complete payment.",
       });
     } catch (err) {
-      console.error("[Booking Create Error]", err);
+      console.error("[Booking Create Error]", err.message);
       res.status(500).json({ error: "Server error" });
-    } finally {
-      if (typeof releaseMutex === 'function') releaseMutex();
     }
   },
 );
@@ -1092,18 +893,38 @@ app.post(
 // ============================================================
 // POST /inquiry — Proxy for GHL Inquiry Webhook
 // ============================================================
+const INQUIRY_ALLOWED_FIELDS = [
+  "full_name", "phone", "email",
+  "quote_checkin_date", "quote_checkout_date",
+  "quote_number_of_pax", "quote_preferred_room_type",
+  "quote_message",
+];
+const INQUIRY_ROOMS = ["", "Bunk Beds", "Barkada Room", "Couple Room", "Family Room", "Not sure yet"];
+
+// Returns the clean fields, or an error message string.
+function validateInquiry(body) {
+  const f = {};
+  for (const k of INQUIRY_ALLOWED_FIELDS) f[k] = String(body[k] ?? "").replace(/[<>]/g, "").trim().slice(0, 1000);
+  if (!f.full_name || f.full_name.length > 100) return "Please enter your name.";
+  if (!/^[0-9+()\-\s]{7,20}$/.test(f.phone)) return "Please enter a valid phone number.";
+  if (f.email.length > 100 || !EMAIL_RE.test(f.email)) return "Please enter a valid email address.";
+  if (!isValidDate(f.quote_checkin_date) || !isValidDate(f.quote_checkout_date) ||
+      f.quote_checkout_date <= f.quote_checkin_date) return "Please check your dates.";
+  if (!/^([1-9]|1[0-5]|16\+)$/.test(f.quote_number_of_pax)) return "Please select the number of guests.";
+  if (!INQUIRY_ROOMS.includes(f.quote_preferred_room_type)) return "Please select a room type.";
+  return f;
+}
+
 app.post(
   "/inquiry",
   requireSessionHint,
   inquiryRateLimiter,
-  express.urlencoded({ extended: true }),
+  express.urlencoded({ extended: false, limit: "20kb" }),
   async (req, res) => {
     try {
-      const header = req.headers["x-session-hint"] || "";
-      const hint = header.split(".")[0];
-      const session = sessionTokens.get(req.sessionHint);
-      
+      const session = req.hvSession;
       if (!req.body.csrfToken || req.body.csrfToken !== session.csrfToken) {
+        secLog(req, "invalid inquiry CSRF token");
         return res.status(403).json({ error: "Invalid CSRF token" });
       }
 
@@ -1111,23 +932,13 @@ app.post(
         return res.status(500).json({ error: "Inquiry webhook not configured." });
       }
 
-      const INQUIRY_ALLOWED_FIELDS = [
-        'full_name', 'phone', 'email',
-        'quote_checkin_date', 'quote_checkout_date',
-        'quote_number_of_pax', 'quote_preferred_room_type',
-        'quote_message'
-      ];
-      const params = new URLSearchParams();
-      for (const key of INQUIRY_ALLOWED_FIELDS) {
-        if (req.body[key] !== undefined) {
-          params.append(key, String(req.body[key]).slice(0, 1000));
-        }
-      }
+      const fields = validateInquiry(req.body);
+      if (typeof fields === "string") return res.status(400).json({ error: fields });
 
       const response = await fetch(GHL_INQUIRY_WEBHOOK_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: params.toString()
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams(fields).toString(),
       });
 
       if (!response.ok) {
@@ -1144,81 +955,44 @@ app.post(
 );
 
 // ============================================================
-// HELPER: Check availability for a single non-bunk room
+// HELPER: Availability check for a booking request
 // ============================================================
-async function checkNonBunkAvailability(apartmentId, checkIn, checkOut) {
+// One Smoobu fetch for the whole request. Returns an error message for the
+// first room that can't be booked, or null. Fails safe if Smoobu is down.
+async function findUnavailableRoom(rooms) {
+  const from = rooms.map((r) => r.checkIn).sort()[0];
+  const to = rooms.map((r) => r.checkOut).sort().at(-1);
+  let bookings;
   try {
-    const url = new URL("https://login.smoobu.com/api/reservations");
-    url.searchParams.set("from", checkIn);
-    url.searchParams.set("to", checkOut);
-    url.searchParams.set("pageSize", "100");
-    url.searchParams.set("excludeBlocked", "false");
-
-    const response = await smoobuFetch(url.toString(), {
-      headers: { "Cache-Control": "no-cache" },
-    });
-
-    if (!response.ok) {
-      console.warn(`[Availability] Smoobu fetch failed for apt ${apartmentId}. Blocking as precaution. Status:`, response.status);
-      return false;
-    }
-
-    const data = await response.json();
-    const bookings = data.bookings || [];
-
-    for (const b of bookings) {
-      if (b.type === "cancellation") continue;
-      if (b.apartment?.id !== apartmentId) continue;
-      if (b.arrival && b.departure && b.arrival < checkOut && b.departure > checkIn) {
-        return false;
-      }
-    }
-
-    return true;
+    bookings = (await fetchReservations(from, to)).filter((b) => b.type !== "cancellation");
   } catch (err) {
-    console.error(`[Availability] Error checking apt ${apartmentId}:`, err.message);
-    return false;
+    console.warn("[Availability] Smoobu fetch failed — blocking as precaution:", err.message);
+    return "We couldn't confirm availability right now. Please try again in a moment.";
   }
+
+  for (const room of rooms) {
+    const overlaps = (b) => b.arrival && b.departure && b.arrival < room.checkOut && b.departure > room.checkIn;
+    if (room.name === "Bunk Beds") {
+      const booked = new Set(bookings.filter((b) => BUNK_APARTMENT_IDS.includes(b.apartment?.id) && overlaps(b)).map((b) => b.apartment.id));
+      const free = BUNK_APARTMENT_IDS.length - booked.size;
+      if (free < room.pax) {
+        return `Not enough bunk beds available for the selected dates. Only ${free} bed${free !== 1 ? "s" : ""} left — you requested ${room.pax}. Please adjust your dates or number of beds.`;
+      }
+    } else if (bookings.some((b) => b.apartment?.id === NON_BUNK_ROOM_APT_IDS[room.name] && overlaps(b))) {
+      return `${room.name} is not available for the selected dates. Please choose different dates or a different room.`;
+    }
+  }
+  return null;
 }
 
-// ============================================================
-// HELPER: Find available Bunk apartments
-// ============================================================
+// Free bunk apartment ids for a stay (used to pick beds for Smoobu drafts).
 async function findAvailableBunkApartments(checkIn, checkOut) {
-  if (!SMOOBU_API_LABEL || !SMOOBU_API_SECRET) return [];
-
   try {
-    const url = new URL("https://login.smoobu.com/api/reservations");
-    url.searchParams.set("from", checkIn);
-    url.searchParams.set("to", checkOut);
-    url.searchParams.set("pageSize", "100");
-    url.searchParams.set("excludeBlocked", "false");
-
-    const response = await smoobuFetch(url.toString(), {
-      headers: { "Cache-Control": "no-cache" },
-    });
-
-    if (!response.ok) {
-      console.warn("[Bunk Picker] Smoobu fetch failed — failing safe. Status:", response.status);
-      return [];
-    }
-
-    const data = await response.json();
-    const bookings = data.bookings || [];
-    const bookedIds = new Set();
-
-    for (const b of bookings) {
-      if (b.type === "cancellation") continue;
-      const aptId = b.apartment?.id;
-      if (!BUNK_APARTMENT_IDS.includes(aptId)) continue;
-      if (b.arrival && b.departure && b.arrival < checkOut && b.departure > checkIn) {
-        bookedIds.add(aptId);
-      }
-    }
-
-    const freeIds = BUNK_APARTMENT_IDS.filter((id) => !bookedIds.has(id));
-    console.log("[Bunk Picker]", checkIn, "→", checkOut, "| booked:", bookedIds.size, "| free IDs:", freeIds);
-    return freeIds;
+    const booked = new Set((await fetchReservations(checkIn, checkOut))
+      .filter((b) => b.type !== "cancellation" && BUNK_APARTMENT_IDS.includes(b.apartment?.id) &&
+        b.arrival && b.departure && b.arrival < checkOut && b.departure > checkIn)
+      .map((b) => b.apartment.id));
+    return BUNK_APARTMENT_IDS.filter((id) => !booked.has(id));
   } catch (err) {
     console.error("[Bunk Picker] Error — failing safe:", err.message);
     return [];
@@ -1229,8 +1003,6 @@ async function findAvailableBunkApartments(checkIn, checkOut) {
 // HELPER: Create Smoobu Draft Booking
 // ============================================================
 async function createSmoobuDraft(data) {
-  if (!CREATE_SMOOBU_DRAFT || !SMOOBU_API_LABEL || !SMOOBU_API_SECRET) return;
-
   for (const room of data.rooms) {
     const isBunk = room.name === "Bunk Beds";
     const bedsNeeded = parseInt(room.pax) || 1;
@@ -1244,12 +1016,7 @@ async function createSmoobuDraft(data) {
       }
       apartmentIds = freeApts.slice(0, bedsNeeded);
     } else {
-      const aptId = resolveApartmentId(room.name);
-      if (!aptId) {
-        console.warn("[Smoobu Draft] Unknown room:", room.name);
-        continue;
-      }
-      apartmentIds = [aptId];
+      apartmentIds = [NON_BUNK_ROOM_APT_IDS[room.name]];
     }
 
     const nameParts = (data.guest.name || "").trim().split(/\s+/);
@@ -1277,7 +1044,8 @@ async function createSmoobuDraft(data) {
         adults: adultsPerUnit,
         price: pricePerUnit,
         priceStatus: 0,
-        notice: `[WEBSITE ${data.bookingId}] ${data.payment.type.toUpperCase()} | ${data.payment.channel.toUpperCase()} | Ref: ${data.payment.referenceNumber} | ${data.payment.channel === "cash" ? "WALK-IN — CASH ON ARRIVAL" : "AWAITING RECEIPT VERIFICATION"}${bedSuffix ? " | " + bedSuffix.trim() : ""}`,
+        // "Ref: <ref>" is parsed back by seedRefsFromSmoobu() — keep the format.
+        notice: `[WEBSITE ${data.bookingId}] ${data.payment.type.toUpperCase()} ₱${data.payment.amount} OF ₱${data.payment.grandTotal} |${data.payment.channel.toUpperCase()} | Ref: ${data.payment.referenceNumber} | ${data.payment.channel === "cash" ? "WALK-IN — CASH ON ARRIVAL" : "AWAITING RECEIPT VERIFICATION"}${bedSuffix ? " | " + bedSuffix.trim() : ""}`,
         language: "en",
       };
 
@@ -1291,20 +1059,13 @@ async function createSmoobuDraft(data) {
         if (response.ok) {
           console.log("[Smoobu Draft Created]", data.bookingId, "room:", room.name + bedSuffix, "aptId:", apartmentId, "smoobuId:", result.id);
         } else {
-          console.warn("[Smoobu Draft Failed]", "aptId:", apartmentId, JSON.stringify(result));
+          console.warn("[Smoobu Draft Failed]", "aptId:", apartmentId, response.status);
         }
       } catch (err) {
         console.error("[Smoobu Draft Network Error]", err.message);
       }
     }
   }
-}
-
-function resolveApartmentId(roomName) {
-  const mapping = ROOM_NAME_TO_APT_ID[roomName];
-  if (!mapping) return null;
-  if (Array.isArray(mapping)) return mapping[0];
-  return mapping;
 }
 
 // ============================================================
@@ -1329,8 +1090,17 @@ async function sendBookingEmail(data) {
     land: "Landbank",
     cash: "Cash on Arrival (Walk-in)",
   };
-  const payTypeNames = { full: "Full Payment", dp: "Downpayment (50%)" };
+  const payTypeNames = { full: "Full Payment", dp: "Downpayment" };
   const isCash = data.payment.channel === "cash";
+  // Only "attack" is flagged: a "suspicious" score fits a real guest (a typo, a stale page).
+  const risky = data.risk && data.risk.level === "attack";
+  const riskHtml = risky
+    ? `<div style="background:#fef3f2;border-left:4px solid #b42318;padding:12px;margin-bottom:16px;border-radius:4px;color:#7a271a;">
+        <strong>⚠️ Check this booking carefully (attack).</strong><br>
+        The same connection also triggered: ${Object.entries(data.risk.reasons).map(([k, v]) => `${esc(k)} ×${esc(v)}`).join(", ")}.
+        Verify the payment receipt before confirming.
+      </div>`
+    : "";
   const actionNeededHtml = isCash
     ? `<strong>⏰ ACTION NEEDED (WALK-IN/CASH):</strong><br>The guest will pay in cash upon arrival. <strong>No payment receipt to verify.</strong>`
     : `<strong>⏰ ACTION NEEDED:</strong><br>Wait for customer's receipt via Messenger (m.me/haidoville), then verify payment and update Smoobu booking status to paid.`;
@@ -1355,6 +1125,7 @@ async function sendBookingEmail(data) {
         <p style="margin:4px 0 0;opacity:0.8;font-size:13px;">Source: ${esc(data.source || "Website (Direct)")}</p>
       </div>
       <div style="background:#f9f9f9;padding:20px;border-radius:0 0 12px 12px;">
+        ${riskHtml}
         <h3 style="margin-top:0;color:#C9A96E;">👤 Guest Details</h3>
         <p style="margin:4px 0;"><strong>Name:</strong> ${esc(data.guest.name)}</p>
         <p style="margin:4px 0;"><strong>Email:</strong> ${esc(data.guest.email)}</p>
@@ -1369,9 +1140,10 @@ async function sendBookingEmail(data) {
         <h3 style="color:#C9A96E;margin-top:20px;">💰 Payment Details (Server Verified)</h3>
         <p style="margin:4px 0;"><strong>Type:</strong> ${payTypeNames[data.payment.type]}</p>
         <p style="margin:4px 0;"><strong>Channel:</strong> ${channelNames[data.payment.channel]}</p>
-        <p style="margin:4px 0;"><strong>Reference #:</strong> <code style="background:#fff;padding:3px 8px;border-radius:4px;">${data.payment.referenceNumber}</code></p>
+        <p style="margin:4px 0;"><strong>Reference #:</strong> <code style="background:#fff;padding:3px 8px;border-radius:4px;">${esc(data.payment.referenceNumber)}</code></p>
         <p style="margin:4px 0;"><strong>Amount Paid:</strong> <span style="color:#C9A96E;font-size:18px;font-weight:bold;">₱${data.payment.amount.toLocaleString()}</span></p>
         <p style="margin:4px 0;"><strong>Grand Total:</strong> ₱${data.payment.grandTotal.toLocaleString()}</p>
+        <p style="margin:4px 0;"><strong>Balance on Check-in:</strong> ₱${(data.payment.grandTotal - data.payment.amount).toLocaleString()}</p>
         <div style="background:#fff;border-left:4px solid #C9A96E;padding:12px;margin-top:20px;border-radius:4px;">
           ${actionNeededHtml}
         </div>
@@ -1384,11 +1156,11 @@ async function sendBookingEmail(data) {
     from: `HaidoVille Booking <${FROM_EMAIL}>`,
     to: ADMIN_EMAIL,
     replyTo: data.guest.email,
-    subject: `🏠 Verified Booking: ${data.bookingId} — ${safeSubjectName}${isCash ? " [WALK-IN/CASH]" : ""}`,
+    subject: `${risky ? "[CHECK] " : ""}🏠 Verified Booking: ${data.bookingId} — ${safeSubjectName}${isCash ? " [WALK-IN/CASH]" : ""}`,
     html,
   });
 
-  console.log("[Email Sent]", ADMIN_EMAIL, "-", data.bookingId);
+  console.log("[Email Sent]", data.bookingId);
 }
 
 // ============================================================
@@ -1403,8 +1175,7 @@ async function forwardToGHL(data) {
     body: JSON.stringify(payload),
   });
   if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`GHL webhook failed (${response.status}): ${errText}`);
+    throw new Error(`GHL webhook failed (${response.status})`);
   }
   console.log("[GHL Webhook Sent]", data.bookingId, "source:", payload.source);
 }
@@ -1484,7 +1255,7 @@ function buildGhlPayload(data) {
     total_amount: String(grandTotal),
     dp_amount: String(dpAmount),
     balance: String(balance),
-    payment_type: data.payment.type === "full" ? "Full Payment" : "Downpayment (50%)",
+    payment_type: data.payment.type === "full" ? "Full Payment" : "Downpayment",
     special_request: data.guest.specialRequest || "",
     room_count: String(data.rooms.length),
     all_rooms: data.rooms.map((r) => ({
@@ -1499,12 +1270,31 @@ function buildGhlPayload(data) {
 }
 
 // ============================================================
-// Start server
+// JSON error handler (bad JSON, oversized bodies, anything unhandled).
+// Without it Express answers with an HTML stack trace.
 // ============================================================
-app.listen(PORT, () => {
-  console.log(`🚀 Secure HaidoVille Smoobu Sync running on port ${PORT}`);
-  console.log(`   Smoobu HMAC:   ${SMOOBU_API_LABEL && SMOOBU_API_SECRET ? "✅" : "❌"}`);
-  console.log(`   Email:         ${RESEND_API_KEY && ADMIN_EMAIL ? "✅" : "⚠️  disabled"}`);
-  console.log(`   GHL Webhook:   ${GHL_WEBHOOK_URL ? "✅" : "⚠️  not configured"}`);
-  console.log(`   Smoobu Drafts: ${CREATE_SMOOBU_DRAFT ? "✅ ON" : "❌ OFF"}`);
+app.use((err, req, res, next) => {
+  if (err.status === 413) return res.status(413).json({ error: "Payload too large." });
+  if (err.status >= 400 && err.status < 500) return res.status(err.status).json({ error: "Bad request." });
+  console.error("[Unhandled]", err.message);
+  res.status(500).json({ error: "Server error" });
 });
+
+export {
+  app, calculateRoomPrice, isValidDate, getEaster, isHolyWeekDate, buildAvailabilityResult,
+  seedRefsFromSmoobu, sendBookingEmail,
+};
+
+// Listen only when run directly (`node server.js`), not when imported by tests.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  app.listen(PORT, () => {
+    console.log(`🚀 Secure HaidoVille Smoobu Sync running on port ${PORT}`);
+    console.log(`   Smoobu HMAC:   ${SMOOBU_API_LABEL && SMOOBU_API_SECRET ? "✅" : "❌"}`);
+    console.log(`   Email:         ${RESEND_API_KEY && ADMIN_EMAIL ? "✅" : "⚠️  disabled"}`);
+    console.log(`   GHL Webhook:   ${GHL_WEBHOOK_URL ? "✅" : "⚠️  not configured"}`);
+    console.log(`   Smoobu Drafts: ${CREATE_SMOOBU_DRAFT ? "✅ ON" : "❌ OFF"}`);
+  });
+  seedRefsFromSmoobu()
+    .then((n) => console.log(`[Refs] Restored ${n} payment reference(s) from Smoobu.`))
+    .catch((err) => console.error("[Refs] Seed from Smoobu failed:", err.message));
+}
