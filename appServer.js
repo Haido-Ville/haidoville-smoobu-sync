@@ -7,9 +7,9 @@
 // ============================================================
 
 import express from "express";
-import rateLimit from "express-rate-limit";
-import crypto from "crypto";
 import { v4 as uuidv4 } from "uuid";
+import { limiter, secLog, fetchReservations } from "./shared.js";
+import { generateGuestPass, verifyGuestPass } from "./encryption.js";
 
 const router = express.Router();
 
@@ -79,25 +79,6 @@ async function resolveFolderId() {
 }
 
 // ============================================================
-// RATE LIMITERS
-// ============================================================
-const listRateLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many requests. Please wait a moment and try again." },
-});
-
-const uploadRateLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many requests. Please wait a moment and try again." },
-});
-
-// ============================================================
 // MIDDLEWARE FACTORY — Attaches session hint middleware
 // ============================================================
 // The actual middleware is injected from server.js so we share
@@ -115,13 +96,24 @@ function requireSession(req, res, next) {
   _requireSessionHint(req, res, next);
 }
 
+// Only guests verified by /guest-access may upload or see photos.
+// 403 (not 401) so the app knows to relock instead of refreshing the session.
+function requireGuestPass(req, res, next) {
+  if (!verifyGuestPass(req.headers["x-guest-pass"])) {
+    secLog(req, "missing or invalid guest pass");
+    return res.status(403).json({ error: "Please verify your booking again." });
+  }
+  next();
+}
+
 // ============================================================
 // GET /app/files — List photos from GHL Media
 // ============================================================
 router.get(
   "/files",
-  listRateLimiter,
+  limiter(60 * 1000, 20),
   requireSession,
+  requireGuestPass,
   async (req, res) => {
     if (!isConfigured()) {
       return res.status(500).json({ error: "GHL Media API not configured." });
@@ -149,14 +141,13 @@ router.get(
       });
 
       if (!ghlRes.ok) {
-        const errText = await ghlRes.text();
-        console.error("[App/GHL] List files error:", ghlRes.status, errText);
+        console.error("[App/GHL] List files error:", ghlRes.status);
         return res.status(502).json({ error: "Could not retrieve files." });
       }
 
       const data = await ghlRes.json();
       const files = (data.files || [])
-        .filter((f) => f.url && /\.(jpg|jpeg|png|gif|webp|svg)$/i.test(f.name || f.url))
+        .filter((f) => f.url && /\.(jpg|jpeg|png|gif|webp)$/i.test(f.name || f.url)) // no SVG: it can carry script
         .map((f) => ({ url: f.url, name: f.name || "Guest photo" }));
 
       res.json({ files });
@@ -168,39 +159,48 @@ router.get(
 );
 
 // ============================================================
-// POST /app/upload — Upload a file to GHL Media
+// POST /app/upload — Upload a photo to GHL Media
 // ============================================================
-// The frontend sends the compressed image as a raw binary stream
+// The frontend sends the compressed image as a raw binary body
 // (application/octet-stream). We rebuild the FormData on the
 // server so we can securely inject the parentId.
 // ============================================================
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024; // the app compresses to ~1920px, well under this
+const IMAGE_TYPES = [
+  { ext: "jpg",  mime: "image/jpeg", is: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  { ext: "png",  mime: "image/png",  is: (b) => b.readUInt32BE(0) === 0x89504e47 },
+  { ext: "webp", mime: "image/webp", is: (b) => b.toString("ascii", 0, 4) === "RIFF" && b.toString("ascii", 8, 12) === "WEBP" },
+];
+
 router.post(
   "/upload",
-  uploadRateLimiter,
+  limiter(60 * 1000, 10),
   requireSession,
+  requireGuestPass,
+  express.raw({ type: () => true, limit: MAX_UPLOAD_BYTES }), // 413 beyond the limit
   async (req, res) => {
     if (!isConfigured()) {
       return res.status(500).json({ error: "GHL Media API not configured." });
     }
 
+    const fileBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    if (fileBuffer.length === 0) {
+      return res.status(400).json({ error: "Empty file payload." });
+    }
+    // Trust the bytes, not the client's name or content type.
+    const type = fileBuffer.length >= 12 && IMAGE_TYPES.find((t) => t.is(fileBuffer));
+    if (!type) {
+      secLog(req, "upload rejected: not a JPEG/PNG/WebP image");
+      return res.status(415).json({ error: "Only JPEG, PNG or WebP images are allowed." });
+    }
+    const fileName = `guest_${Date.now()}_${uuidv4().slice(0, 8)}.${type.ext}`;
+
     try {
       const folderId = await resolveFolderId();
-      const fileName = req.headers["x-file-name"] || `guest_${Date.now()}.jpg`;
-
-      // Read raw binary body
-      const chunks = [];
-      for await (const chunk of req) {
-        chunks.push(chunk);
-      }
-      const fileBuffer = Buffer.concat(chunks);
-
-      if (fileBuffer.length === 0) {
-        return res.status(400).json({ error: "Empty file payload." });
-      }
 
       // Build a clean FormData for GHL
       const formData = new FormData();
-      formData.append("file", new Blob([fileBuffer]), fileName);
+      formData.append("file", new Blob([fileBuffer], { type: type.mime }), fileName);
       formData.append("hosted", "false");
       formData.append("fileUrl", "");
       formData.append("name", fileName);
@@ -217,8 +217,7 @@ router.post(
       });
 
       if (!ghlRes.ok) {
-        const errText = await ghlRes.text();
-        console.error("[App/GHL] Upload error:", ghlRes.status, errText);
+        console.error("[App/GHL] Upload error:", ghlRes.status);
         return res.status(502).json({ error: "Upload failed." });
       }
 
@@ -233,200 +232,101 @@ router.post(
 );
 
 // ============================================================
-// SMOOBU HMAC FETCH HELPER (mirrors server.js logic)
-// ============================================================
-const SMOOBU_API_LABEL  = process.env.SMOOBU_API_LABEL;
-const SMOOBU_API_SECRET = process.env.SMOOBU_API_SECRET;
-
-async function smoobuFetch(url, options = {}) {
-  if (!SMOOBU_API_LABEL || !SMOOBU_API_SECRET) {
-    throw new Error("SMOOBU_API_LABEL or SMOOBU_API_SECRET not configured");
-  }
-
-  const method = (options.method || "GET").toUpperCase();
-  const parsed = new URL(url);
-  const pathname = parsed.pathname;
-
-  // Sort query params alphabetically
-  const params = [...parsed.searchParams.entries()]
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([k, v]) => `${k}=${v}`)
-    .join("&");
-
-  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
-  const nonce = uuidv4();
-
-  const bodyStr = options.body || "";
-  const bodyHash = crypto.createHash("sha256").update(bodyStr).digest("hex");
-
-  const canonical = `${method}\n${pathname}\n${params}\n${timestamp}\n${nonce}\n${bodyHash}\n${SMOOBU_API_LABEL}`;
-
-  const signature = crypto
-    .createHmac("sha256", SMOOBU_API_SECRET)
-    .update(canonical)
-    .digest("base64");
-
-  const headers = {
-    ...options.headers,
-    "X-API-Key": SMOOBU_API_LABEL,
-    "X-Timestamp": timestamp,
-    "X-Nonce": nonce,
-    "X-Signature": signature,
-  };
-
-  delete headers["Api-Key"];
-
-  return fetch(url, { ...options, method, headers });
-}
-
-// ============================================================
 // SMOOBU RESERVATION CACHE (60-second TTL)
 // ============================================================
 let _reservationCache = null;
 let _reservationCacheTs = 0;
-const RESERVATION_CACHE_TTL_MS = 60 * 1000; // 60 seconds
+const RESERVATION_CACHE_TTL_MS = 60 * 1000;
 
-async function fetchAllBookedReservations() {
+const isoDay = (offsetDays) => new Date(Date.now() + offsetDays * 86400000).toISOString().slice(0, 10);
+
+// Real guest reservations (no cancellations or blocks) for stays that haven't ended yet.
+async function fetchActiveReservations() {
   const now = Date.now();
   if (_reservationCache && now - _reservationCacheTs < RESERVATION_CACHE_TTL_MS) {
     return _reservationCache;
   }
-
-  const allBookings = [];
-  let currentPage = 1;
-  let totalPages = 1;
-
-  while (currentPage <= totalPages) {
-    const url = `https://login.smoobu.com/api/reservations?showCancellation=false&pageSize=100&page=${currentPage}`;
-    const res = await smoobuFetch(url);
-
-    if (!res.ok) {
-      const errText = await res.text();
-      console.error(`[App/Smoobu] Reservations API error (page ${currentPage}):`, res.status, errText);
-      break;
-    }
-
-    const data = await res.json();
-    const bookings = data.bookings || [];
-    allBookings.push(...bookings);
-
-    totalPages = data.page_count || 1;
-    currentPage++;
-  }
-
-  // Filter: only real guest reservations (not cancellations, not calendar blocks)
-  const filtered = allBookings.filter(b =>
-    b.type === "reservation" &&
-    b["is-blocked-booking"] === false
-  );
-
-  _reservationCache = filtered;
+  const today = isoDay(0);
+  const all = await fetchReservations(isoDay(-1), isoDay(365), { showCancellation: "false" });
+  _reservationCache = all.filter((b) =>
+    b.type === "reservation" && b["is-blocked-booking"] === false && (b.departure || "") >= today);
   _reservationCacheTs = now;
-
-  console.log(`[App/Smoobu] Cached ${filtered.length} active reservations (from ${allBookings.length} total across ${totalPages} page(s))`);
-  return filtered;
+  return _reservationCache;
 }
+
+// Lowercase, strip accents, collapse spaces: "  José  Dela Cruz " -> "jose dela cruz"
+const normName = (s) => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").trim().toLowerCase().replace(/\s+/g, " ");
 
 // ============================================================
 // POST /app/guest-access — Verify guest via Smoobu bookings
 // ============================================================
+// Grants access when the email matches exactly, or (for OTA guests
+// whose Smoobu email is a relay address) the FULL name matches exactly.
+// Only current/upcoming stays count. The response is yes/no plus a signed
+// guest pass: no booking id, name or guest-app link is ever returned.
 router.post(
   "/guest-access",
-  rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 20,                  // limit each IP to 20 requests per windowMs
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { access: false }, // Generic fail for rate limit
-  }),
+  limiter(15 * 60 * 1000, 20, { access: false }),
   async (req, res) => {
-    // 1. CORS restriction (if ALLOWED_ORIGIN is set)
+    // 1. Origin restriction (if ALLOWED_ORIGIN is set)
     const allowedOriginsEnv = process.env.ALLOWED_ORIGIN;
     const origin = (req.headers.origin || "").replace(/\/$/, "");
     if (allowedOriginsEnv && origin) {
-      const allowedOrigins = allowedOriginsEnv.split(',').map(o => o.trim());
+      const allowedOrigins = allowedOriginsEnv.split(",").map((o) => o.trim());
       const isTrustedGhl = origin.endsWith(".leadconnectorhq.com") || origin.endsWith(".gohighlevel.com") || origin.endsWith(".msgsndr.com");
-      
       if (!allowedOrigins.includes(origin) && !isTrustedGhl) {
-        console.error("[App/Smoobu] CORS blocked origin:", origin);
+        secLog(req, "guest-access blocked origin");
         return res.status(403).json({ access: false });
       }
     }
 
     // 2. Validate Smoobu credentials
-    if (!SMOOBU_API_LABEL || !SMOOBU_API_SECRET) {
+    if (!process.env.SMOOBU_API_LABEL || !process.env.SMOOBU_API_SECRET) {
       console.error("[App/Smoobu] SMOOBU_API_LABEL or SMOOBU_API_SECRET not configured.");
       return res.status(500).json({ access: false });
     }
 
-    const { firstName, email } = req.body;
-    const cleanEmail = (email || '').trim().toLowerCase();
-    const cleanName = (firstName || '').trim().toLowerCase();
+    const body = req.body || {};
+    const cleanEmail = String(body.email || "").trim().toLowerCase();
+    const cleanName = normName(body.firstName);
+    // A full name (2+ words) is required for the name path; one word is too easy to guess.
+    const nameUsable = cleanName.split(" ").length >= 2;
 
-    if (!cleanEmail && !cleanName) {
+    if (!cleanEmail && !nameUsable) {
       return res.status(400).json({ access: false });
     }
 
     try {
-      const reservations = await fetchAllBookedReservations();
-      let matchedBooking = null;
+      const reservations = await fetchActiveReservations();
+      const matchedBooking =
+        (cleanEmail && reservations.find((b) => String(b.email || "").trim().toLowerCase() === cleanEmail)) ||
+        (nameUsable && reservations.find((b) => normName(b["guest-name"]) === cleanName));
 
-      // 1. Try match by email first (case-insensitive, trimmed)
-      if (cleanEmail) {
-        matchedBooking = reservations.find(b => {
-          const bEmail = (b.email || '').trim().toLowerCase();
-          return bEmail && bEmail === cleanEmail;
-        });
-        if (matchedBooking) {
-          console.log(`[App/Smoobu] Access granted via EMAIL for: ${cleanEmail}`);
-        }
+      if (!matchedBooking) {
+        secLog(req, "guest-access denied");
+        return res.json({ access: false });
       }
 
-      // 2. Fallback: fuzzy match by guest name (substring either direction)
-      if (!matchedBooking && cleanName) {
-        matchedBooking = reservations.find(b => {
-          const guestName = (b["guest-name"] || '').trim().toLowerCase();
-          if (!guestName) return false;
-          return guestName.includes(cleanName) || cleanName.includes(guestName);
-        });
-        if (matchedBooking) {
-          console.log(`[App/Smoobu] Access granted via NAME for: ${cleanName}`);
-        }
+      console.log(`[App/Smoobu] Guest access granted (booking ${matchedBooking.id})`);
+
+      // Optional: fire automation webhook in background if configured
+      const webhookUrl = process.env.GHL_GUEST_PORTAL_WEBHOOK_URL;
+      if (webhookUrl) {
+        fetch(webhookUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            first_name: (matchedBooking["guest-name"] || "").split(/\s+/)[0] || "",
+            email: matchedBooking.email || cleanEmail,
+            source: "Mini App Gate",
+            tag: "guest-portal-access",
+          }),
+        }).catch((err) => console.error("[App/Smoobu] Background webhook failed:", err.message));
       }
 
-      // 3. Evaluate result
-      if (matchedBooking) {
-        // Extract first name from guest-name (take the first word)
-        const guestFullName = matchedBooking["guest-name"] || '';
-        const resolvedFirstName = guestFullName.split(/\s+/)[0] || firstName || '';
-
-        // Optional: Fire automation webhook in background if configured
-        const webhookUrl = process.env.GHL_GUEST_PORTAL_WEBHOOK_URL;
-        if (webhookUrl) {
-          fetch(webhookUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              first_name: resolvedFirstName,
-              email: matchedBooking.email || email || '',
-              source: 'Mini App Gate',
-              tag: 'guest-portal-access'
-            })
-          }).catch(err => console.error("[App/Smoobu] Background webhook failed:", err.message));
-        }
-
-        return res.json({
-          access: true,
-          firstName: resolvedFirstName,
-          bookingId: matchedBooking.id,
-          guestAppUrl: matchedBooking["guest-app-url"] || null,
-        });
-      }
-
-      // No match found
-      console.warn(`[App/Smoobu] Access denied for: Name="${firstName}", Email="${email}"`);
-      return res.json({ access: false });
-
+      // The pass unlocks /files and /upload until 2 days after checkout (Manila time).
+      const exp = Date.parse(matchedBooking.departure + "T00:00:00+08:00") + 2 * 86400000;
+      return res.json({ access: true, pass: generateGuestPass(exp) });
     } catch (err) {
       console.error("[App/Smoobu] Guest verification exception:", err.message);
       return res.status(500).json({ access: false });
