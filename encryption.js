@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import zlib from "zlib";
 
 // ─── Hint token helpers ────────────────────────────────────────────────────────
 export const HINT_TTL_MS = 15 * 60 * 1000; // 15-minute window
@@ -47,4 +48,43 @@ export function verifyGuestPass(pass) {
   if (!/^\d+$/.test(exp) || !/^[0-9a-f]{64}$/.test(sig || "")) return false;
   if (Date.now() > Number(exp)) return false;
   return crypto.timingSafeEqual(Buffer.from(sig, "hex"), Buffer.from(guestPassSig(exp), "hex"));
+}
+
+// ─── Sealed links (staff confirm page, booking receipt) ────────────────────────
+// There is no database: each link carries its own booking data. AES-256-GCM
+// encrypts it (guest details aren't readable in the URL) and authenticates it
+// (a changed character fails to open). The key comes from RECEIPT_SECRET, a
+// fixed env secret, so links keep working across restarts.
+const MAX_LINK_LENGTH = 4096;
+
+function linkKey() {
+  const secret = process.env.RECEIPT_SECRET;
+  if (!secret) throw new Error("[Encryption] RECEIPT_SECRET env var not set.");
+  return crypto.createHash("sha256").update(secret).digest();
+}
+
+export function sealLink(kind, data, ttlMs) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", linkKey(), iv);
+  const plain = zlib.deflateRawSync(JSON.stringify({ ...data, v: 1, kind, exp: Date.now() + ttlMs }));
+  return Buffer.concat([iv, cipher.update(plain), cipher.final(), cipher.getAuthTag()]).toString("base64url");
+}
+
+// The sealed data, or null when the link is missing, changed, expired or of another kind.
+export function openLink(kind, token) {
+  try {
+    token = String(token || "");
+    if (token.length > MAX_LINK_LENGTH) return null;
+    const buf = Buffer.from(token, "base64url");
+    // Node skips invalid base64 characters; only the exact encoding is accepted.
+    if (buf.length < 12 + 16 + 1 || buf.toString("base64url") !== token) return null;
+    const decipher = crypto.createDecipheriv("aes-256-gcm", linkKey(), buf.subarray(0, 12));
+    decipher.setAuthTag(buf.subarray(-16));
+    // final() checks the tag first, so only authentic data is ever inflated.
+    const plain = Buffer.concat([decipher.update(buf.subarray(12, -16)), decipher.final()]);
+    const data = JSON.parse(zlib.inflateRawSync(plain));
+    return data.v === 1 && data.kind === kind && Date.now() < data.exp ? data : null;
+  } catch {
+    return null;
+  }
 }

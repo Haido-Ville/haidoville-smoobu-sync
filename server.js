@@ -26,7 +26,7 @@ import { fileURLToPath } from "url";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
-import { generateHint, verifyHint, HINT_TTL_MS } from "./encryption.js";
+import { generateHint, verifyHint, HINT_TTL_MS, sealLink, openLink } from "./encryption.js";
 import { limiter, secLog, safeEqual, smoobuFetch, fetchReservations, recordBooking, securityStatus } from "./shared.js";
 import appServerRouter, { setSessionHintMiddleware } from "./appServer.js";
 
@@ -76,6 +76,14 @@ const GHL_WEBHOOK_URL = process.env.GHL_WEBHOOK_URL || "";
 const GHL_INQUIRY_WEBHOOK_URL = process.env.GHL_INQUIRY_WEBHOOK_URL || "";
 const CACHE_DURATION_MS = 5 * 60 * 1000;
 const CREATE_SMOOBU_DRAFT = process.env.CREATE_SMOOBU_DRAFT === "true";
+// Staff payment confirmation: the server calls these GHL workflows (see /staff/booking).
+const GHL_ACTION_WEBHOOKS = {
+  dp: process.env.GHL_DP_WEBHOOK_URL || "",       // "Mark DP Received"
+  full: process.env.GHL_PAID_WEBHOOK_URL || "",   // "Mark Payment Received"
+  issue: process.env.GHL_ISSUE_WEBHOOK_URL || "", // "Pay Issue"
+};
+// Base URL of this server, for links sent to GHL.
+const PUBLIC_API_URL = (process.env.PUBLIC_API_URL || "https://haidoville-smoobu-sync.onrender.com").replace(/\/+$/, "");
 
 // ---- Secure Configuration Keys ----
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
@@ -96,6 +104,24 @@ rotateJwtKeys();
 setInterval(rotateJwtKeys, JWT_ROTATE_MS).unref();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// HTML-escape guest text for emails and pages.
+const esc = (s) =>
+  String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#x27;");
+
+const CHANNEL_NAMES = { gcash: "GCash", maya: "Maya", metro: "Metrobank", land: "Landbank", cash: "Cash on Arrival (Walk-in)" };
+const peso = (n) => "₱" + Number(n || 0).toLocaleString("en-US");
+// "2026-11-14" -> "Nov 14, 2026"
+const fmtDay = (ymd) => new Date(ymd + "T00:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" });
+// ISO time -> "Oct 14, 2026, 3:42 PM" (Manila)
+const fmtManilaTime = (iso) => new Date(iso).toLocaleString("en-US", {
+  timeZone: "Asia/Manila", month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit",
+});
 const isoDay = (offsetDays) => new Date(Date.now() + offsetDays * 86400000).toISOString().slice(0, 10);
 
 // ============================================================
@@ -188,6 +214,31 @@ function isValidDate(str) {
   if (!DATE_REGEX.test(str)) return false;
   const d = new Date(str + "T00:00:00Z"); // UTC, so the round-trip below works in any server timezone
   return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === str;
+}
+
+// ---- Booker age (18+) ----
+// The booker's age is always computed here from the birth date, on Manila's
+// calendar day. The age sent by the browser is never trusted.
+const UNDER_AGE_MSG = "The person making this booking must be 18 or older. Please ask an adult or guardian to book.";
+const BAD_DOB_MSG = "Please enter a valid date of birth.";
+const manilaToday = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Manila" }); // YYYY-MM-DD
+
+// Whole years old today, or null for a missing, invalid or future date.
+function bookerAge(birthDate) {
+  if (typeof birthDate !== "string" || !isValidDate(birthDate)) return null;
+  const today = manilaToday();
+  if (birthDate > today) return null;
+  // Feb 29 birthdays turn a year older on Mar 1 in non-leap years.
+  return Number(today.slice(0, 4)) - Number(birthDate.slice(0, 4)) - (today.slice(5) < birthDate.slice(5) ? 1 : 0);
+}
+
+// Error message when this booker can't book, or null.
+function bookerError(birthDate, ageConfirmed) {
+  const age = bookerAge(birthDate);
+  if (age === null || age > 120) return BAD_DOB_MSG;
+  if (age < 18) return UNDER_AGE_MSG;
+  if (ageConfirmed !== true) return "Please confirm you understand the ID requirement.";
+  return null;
 }
 
 // ---- Booking ID generator ----
@@ -293,7 +344,7 @@ app.use((req, res, next) => {
     res.setHeader(
       "Access-Control-Allow-Headers",
       // X-Timestamp is still sent by the booking modal; it is no longer checked.
-      "Content-Type, X-API-Key, X-Calendar-Access, Authorization, X-Session-Hint, X-Guest-Pass, X-Timestamp, X-File-Name"
+      "Content-Type, X-API-Key, X-Calendar-Access, Authorization, X-Session-Hint, X-Guest-Pass, X-Booker-Pass, X-Timestamp, X-File-Name"
     );
   } else {
     res.setHeader("Access-Control-Allow-Origin", "https://haidoville.com");
@@ -363,12 +414,40 @@ const requireJwtToken = (req, res, next) => {
     secLog(req, "invalid booking token");
     return res.status(403).json({ error: "Invalid or expired token." });
   }
+  if (!decoded.jti) { // a booker pass is signed with the same key but is not a booking token
+    secLog(req, "invalid booking token");
+    return res.status(403).json({ error: "Invalid or expired token." });
+  }
   if (usedTokens.has(decoded.jti)) {
     secLog(req, "booking token reused");
     return res.status(401).json({ error: "Unauthorized" });
   }
   usedTokens.set(decoded.jti, decoded.exp * 1000);
   persistUsedTokens();
+  next();
+};
+
+// ---- Booker pass ----
+// Issued by /booking/verify-booker once the booker is 18+. It carries the
+// verified birth date, so the booking can't swap in a different one later.
+// Payment details, the booking token and the booking itself all require it.
+const BOOKER_PASS_TTL = "30m";
+const signBookerPass = (birthDate) =>
+  jwt.sign({ typ: "booker", bd: birthDate }, JWT_CURR_SEC, { expiresIn: BOOKER_PASS_TTL, algorithm: "HS256" });
+
+const requireBookerPass = (req, res, next) => {
+  const token = String(req.headers["x-booker-pass"] || "");
+  let decoded;
+  for (const key of [JWT_CURR_SEC, JWT_PREV_SEC]) {
+    try { decoded = jwt.verify(token, key, { algorithms: ["HS256"] }); break; } catch { /* try previous key */ }
+  }
+  if (decoded?.typ !== "booker" || bookerError(decoded.bd, true)) {
+    // Also an expired pass (30 min) or a server restart; the page re-checks the age and retries.
+    secLog(req, "missing or invalid booker pass");
+    return res.status(403).json({ error: "Please confirm your details again.", code: "BOOKER_PASS" });
+  }
+  req.bookerBirthDate = decoded.bd;
+  req.bookerConfirmedAt = decoded.iat * 1000; // when the booker ticked "I Understand" (last re-check)
   next();
 };
 
@@ -577,9 +656,20 @@ app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
 });
 
 // ============================================================
-// GET /api/payment-methods — Serves payment data
+// POST /booking/verify-booker — Step 2 -> 3 age check (18+)
 // ============================================================
-app.get("/api/payment-methods", tokenRateLimiter, requireSessionHint, (req, res) => {
+// Doesn't use up the session: the page re-checks quietly when a pass expires.
+app.post("/booking/verify-booker", tokenRateLimiter, requireValidSessionHint, (req, res) => {
+  const { birthDate, ageConfirmed } = req.body || {};
+  const error = bookerError(birthDate, ageConfirmed);
+  if (error) return res.status(400).json({ error });
+  res.json({ pass: signBookerPass(birthDate) });
+});
+
+// ============================================================
+// GET /api/payment-methods — Serves payment data (verified booker only)
+// ============================================================
+app.get("/api/payment-methods", tokenRateLimiter, requireSessionHint, requireBookerPass, (req, res) => {
   res.json({
     payments: {
       gcash: { number: process.env.GCASH_NUMBER, owner: process.env.GCASH_OWNER },
@@ -657,7 +747,7 @@ function buildAvailabilityResult(allBookings) {
 // ============================================================
 // GET /booking-token (issues one-time JWT)
 // ============================================================
-app.get("/booking-token", tokenRateLimiter, requireSessionHint, (req, res) => {
+app.get("/booking-token", tokenRateLimiter, requireSessionHint, requireBookerPass, (req, res) => {
   const token = jwt.sign({ jti: uuidv4() }, JWT_CURR_SEC, { expiresIn: JWT_EXPIRATION, algorithm: "HS256" });
   res.json({ token });
 });
@@ -683,6 +773,7 @@ app.post(
   "/bookings/create",
   bookingRateLimiter,
   requireSessionHint,
+  requireBookerPass, // before the token, so a re-checked pass can retry with the same token
   requireJwtToken,
   async (req, res) => {
     try {
@@ -726,6 +817,16 @@ app.post(
       if (!EMAIL_RE.test(sanitizedGuest.email)) {
         return res.status(400).json({ error: "Invalid email address." });
       }
+
+      // The page only gets here after verify-booker, so a failure means a tampered request.
+      const ageError = bookerError(rawData.guest.birthDate, rawData.guest.ageConfirmed);
+      if (ageError || rawData.guest.birthDate !== req.bookerBirthDate) {
+        secLog(req, "booker age details tampered");
+        return res.status(400).json({ error: ageError || "Please confirm your details again." });
+      }
+      sanitizedGuest.birthDate = req.bookerBirthDate;
+      sanitizedGuest.ageConfirmedAt = new Date(req.bookerConfirmedAt).toISOString();
+      sanitizedGuest.age = String(bookerAge(req.bookerBirthDate)); // GHL "age" field
 
       const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
       const emailKey = sanitizedGuest.email.toLowerCase();
@@ -891,6 +992,294 @@ app.post(
 );
 
 // ============================================================
+// STAFF PAYMENT CONFIRMATION + BOOKING RECEIPT
+// ============================================================
+// The payment-check email (GHL) links each button to
+//   /staff/booking/<sealed booking>?action=dp|full|issue&contact_id=<GHL id>
+// GET only shows a confirm page, so email scanners that open links change
+// nothing. POST calls the matching GHL workflow with a sealed receipt link.
+// No database: the booking travels inside the sealed link (encryption.js).
+const STAFF_LINK_TTL_MS = 60 * 24 * 60 * 60 * 1000;
+const RECEIPT_TTL_MS = 365 * 24 * 60 * 60 * 1000;
+const STAFF_ACTIONS = {
+  dp: { button: "Confirm DP received", done: "DP received", badge: "DOWNPAYMENT RECEIVED" },
+  full: { button: "Confirm fully paid", done: "Fully paid", badge: "FULLY PAID" },
+  issue: { button: "Flag payment issue", done: "Payment issue flagged" },
+};
+const CONTACT_ID_RE = /^[A-Za-z0-9]{1,64}$/;
+const linksEnabled = () => Boolean(process.env.RECEIPT_SECRET);
+
+// Only what the confirm page and the receipt show.
+function bookingSnapshot(data) {
+  const g = data.guest;
+  return {
+    id: data.bookingId,
+    at: data.submittedAt,
+    guest: { name: g.name, email: g.email, phone: g.phone, birthDate: g.birthDate, age: g.age, ageConfirmedAt: g.ageConfirmedAt },
+    rooms: data.rooms.map((r) => ({ name: r.name, checkIn: r.checkIn, checkOut: r.checkOut, nights: r.nights, pax: r.pax, paxLabel: r.paxLabel, subtotal: r.subtotal })),
+    payment: {
+      channel: data.payment.channel, type: data.payment.type, amount: data.payment.amount,
+      grandTotal: data.payment.grandTotal, referenceNumber: data.payment.referenceNumber,
+    },
+  };
+}
+
+function staffLink(data) {
+  if (!linksEnabled()) return "";
+  return `${PUBLIC_API_URL}/staff/booking/${sealLink("staff", { b: bookingSnapshot(data) }, STAFF_LINK_TTL_MS)}`;
+}
+
+function paymentStatus(p) {
+  if (p.channel === "cash") return `Cash on arrival — ${peso(p.grandTotal)} due at check-in`;
+  return `${p.type === "full" ? "Full payment" : "Downpayment"} ${peso(p.amount)} sent — awaiting verification`;
+}
+
+// What a confirmed action means for the money: "full" = the whole total is in.
+const paidFor = (b, action) => (action === "full" ? b.payment.grandTotal : b.payment.amount);
+
+// bookingId:action -> { receipt, guest } links ("" for issue). `true` = pending, blocks a double click.
+// ponytail: in memory only; after a restart a repeat confirm calls GHL again
+// (GHL may re-send the receipt email). A database would remove this.
+const confirmedActions = new Map();
+const MAX_CONFIRMED = 5000;
+
+// Staff pages: no caching, no indexing, no referrer (the URL is the key), and a
+// CSP that allows only inline styles, our own form, the logo and one nonce script.
+const STAFF_FOOTER = "HaidoVille · Staff only · Don't forward this page outside the team.";
+const GUEST_FOOTER = "HaidoVille Vacation Home Rental · Tourism Road, Brgy. Poblacion 3, General Luna, Siargao Island";
+const PRINT_SCRIPT = 'document.getElementById("print").addEventListener("click", function () { window.print(); });';
+
+function sendPage(res, status, title, body, { script = "", footer = STAFF_FOOTER } = {}) {
+  const nonce = crypto.randomBytes(16).toString("base64");
+  res.status(status);
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("X-Robots-Tag", "noindex");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Content-Security-Policy",
+    `default-src 'none'; style-src 'unsafe-inline'; img-src https://assets.cdn.filesafe.space; form-action 'self'; script-src 'nonce-${nonce}'; base-uri 'none'; frame-ancestors 'none'`);
+  res.type("html").send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>${esc(title)} · HaidoVille</title>
+<style>
+  :root { --gold:#C9A96E; --ink:#1a1a1a; --mid:#6b6b6b; --line:#eceae3; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:#f0efe9; color:var(--ink); font:14px/1.5 Arial, Helvetica, sans-serif; }
+  .wrap { max-width:640px; margin:0 auto; padding:24px 16px; }
+  .card { background:#fff; border-radius:16px; overflow:hidden; box-shadow:0 8px 30px rgba(0,0,0,0.06); }
+  .head { background:#0e0d0b; padding:22px 24px; text-align:center; }
+  .head img { height:40px; }
+  .band { background:linear-gradient(135deg,#C9A96E,#b8935a); padding:16px 24px; text-align:center; color:#1a1612; }
+  .band small { display:block; font-size:10px; font-weight:700; letter-spacing:2px; text-transform:uppercase; opacity:.7; }
+  .band strong { font-size:22px; letter-spacing:2px; }
+  .body { padding:24px; }
+  h1 { font-size:20px; margin:0 0 6px; }
+  p { margin:0 0 14px; color:var(--mid); }
+  .badge { display:inline-block; padding:6px 14px; border-radius:50px; font-size:11px; font-weight:800; letter-spacing:1.5px; background:#e8f6ee; color:#1e7a46; }
+  .badge.issue { background:#fdecea; color:#b42318; }
+  h2 { font-size:11px; letter-spacing:2px; text-transform:uppercase; color:var(--gold); margin:22px 0 8px; }
+  table { width:100%; border-collapse:collapse; }
+  td { padding:9px 0; border-bottom:1px solid var(--line); vertical-align:top; }
+  td:first-child { color:var(--mid); width:45%; }
+  .rooms td:first-child { width:auto; } /* room name + dates need the width */
+  td:last-child { text-align:right; font-weight:700; }
+  .total td { font-size:16px; border-bottom:0; }
+  .check { list-style:none; padding:0; margin:0; }
+  .check li { padding:8px 0 8px 30px; position:relative; border-bottom:1px solid var(--line); }
+  .check li::before { content:""; position:absolute; left:0; top:8px; width:18px; height:18px; border:2px solid var(--ink); border-radius:4px; }
+  .btn { display:block; width:100%; padding:15px; border:0; border-radius:50px; background:linear-gradient(135deg,#e8c98a,#C9A96E 55%,#b8924f); color:#1a1612;
+    font:800 13px Arial, sans-serif; letter-spacing:1px; text-transform:uppercase; text-align:center; text-decoration:none; cursor:pointer; margin-top:18px; }
+  .btn.issue { background:#c0392b; color:#fff; }
+  .note { font-size:12px; color:#999; text-align:center; margin-top:12px; }
+  .note a { color:#b8935a; }
+  .notice { background:#fff8f0; border:1px solid rgba(201,169,110,0.35); border-left:4px solid var(--gold); border-radius:12px; padding:14px 16px; margin-top:22px; }
+  .notice strong { display:block; color:#b8935a; margin-bottom:4px; }
+  .notice ul { margin:0; padding-left:18px; color:var(--mid); }
+  .id-alert { display:flex; gap:12px; align-items:flex-start; margin:16px 0 4px; padding:14px 16px; border-radius:12px;
+    background:#fff4e0; border:1px solid rgba(201,169,110,0.5); border-left:5px solid var(--gold); }
+  .id-alert svg { flex-shrink:0; width:28px; height:28px; color:#b8935a; }
+  .id-alert b { display:block; font-size:14px; color:var(--ink); margin-bottom:2px; }
+  .id-alert span { color:#5a4a2e; }
+  .id-alert strong { color:var(--ink); }
+  .foot { text-align:center; font-size:11px; color:#999; padding:16px; }
+  /* One printed page: tighter spacing on paper. */
+  @page { margin:10mm; }
+  @media print {
+    body { background:#fff; font-size:12px; } .wrap { padding:0; } .card { box-shadow:none; } .noprint { display:none; }
+    .head { padding:10px; } .head img { height:28px; } .band { padding:8px; } .band strong { font-size:18px; }
+    .body { padding:12px 16px; } h2 { margin:12px 0 4px; } td { padding:5px 0; } .check li { padding:5px 0 5px 28px; }
+    .check li::before { top:5px; } .notice { margin-top:12px; padding:10px 12px; } .foot { padding:8px; }
+  }
+</style></head>
+<body><div class="wrap"><div class="card">
+<div class="head"><img src="https://assets.cdn.filesafe.space/s7j5HqPutVcKrXgWP2oR/media/69b8babe87f0f20a644bf122.png" alt="HaidoVille"></div>
+${body}
+</div><div class="foot">${esc(footer)}</div></div>
+${script ? `<script nonce="${nonce}">${script}</script>` : ""}
+</body></html>`);
+}
+
+const errorPage = (res, status, message) =>
+  sendPage(res, status, "Link problem", `<div class="body"><h1>Can't open this page</h1><p>${esc(message)}</p></div>`);
+
+const INVALID_LINK = "This link is invalid or expired. Open the latest email from GHL, or ask the admin.";
+
+// Rows shared by the confirm page and the receipt.
+function bookingRows(b) {
+  const rooms = b.rooms.map((r) => `<tr><td>${esc(r.name)}<br><small>${esc(fmtDay(r.checkIn))} → ${esc(fmtDay(r.checkOut))} · ${esc(r.nights)} nights · ${esc(r.pax)} ${esc(r.paxLabel || "Guests")}</small></td><td>${esc(peso(r.subtotal))}</td></tr>`).join("");
+  return {
+    guest: `<tr><td>Name</td><td>${esc(b.guest.name)}</td></tr>
+      <tr><td>Phone</td><td>${esc(b.guest.phone)}</td></tr>
+      <tr><td>Email</td><td>${esc(b.guest.email)}</td></tr>`,
+    rooms,
+  };
+}
+
+// Opens the staff link and checks the query; sends the error page and returns null when invalid.
+function readStaffRequest(req, res) {
+  if (!linksEnabled()) { errorPage(res, 503, "Receipts are not set up on the server yet (RECEIPT_SECRET)."); return null; }
+  const sealed = openLink("staff", req.params.token);
+  if (!sealed) { secLog(req, "invalid staff or receipt link"); errorPage(res, 400, INVALID_LINK); return null; }
+  const action = String(req.query.action || "");
+  const contactId = String(req.query.contact_id || "");
+  if (!Object.hasOwn(STAFF_ACTIONS, action) || !CONTACT_ID_RE.test(contactId)) {
+    errorPage(res, 400, "This link is incomplete. Use the button in the GHL email.");
+    return null;
+  }
+  return { b: sealed.b, action, contactId };
+}
+
+function confirmedPage(res, b, action, links, already) {
+  const a = STAFF_ACTIONS[action];
+  sendPage(res, 200, a.done, `<div class="band"><small>${already ? "Already confirmed" : "Done"}</small><strong>${esc(b.id)}</strong></div>
+<div class="body">
+  <h1>${already ? "Already confirmed: " : ""}${esc(a.done)}</h1>
+  <p>${esc(b.guest.name)} · ${action === "issue" ? "The Pay Issue workflow in GHL has been started." : "GHL has been updated, the receipt was emailed to staff, and the guest's copy went to GHL."}</p>
+  ${links.receipt ? `<a class="btn" href="${esc(links.receipt)}">View receipt</a>
+  <p class="note"><a href="${esc(links.guest)}">View the guest's copy</a></p>` : ""}
+</div>`);
+}
+
+app.get("/staff/booking/:token", adminLimiter, (req, res) => {
+  const r = readStaffRequest(req, res);
+  if (!r) return;
+  const { b, action } = r;
+  const done = confirmedActions.get(`${b.id}:${action}`);
+  if (typeof done === "object") return confirmedPage(res, b, action, done, true);
+
+  const a = STAFF_ACTIONS[action];
+  const rows = bookingRows(b);
+  sendPage(res, 200, a.button, `<div class="band"><small>Payment check</small><strong>${esc(b.id)}</strong></div>
+<div class="body">
+  <h1>${esc(a.button)}?</h1>
+  <p>Check the guest's payment first. Confirming updates GHL${action === "issue" ? "." : " and emails the receipt to staff."}</p>
+  <h2>Guest</h2><table>${rows.guest}</table>
+  <h2>Stay</h2><table class="rooms">${rows.rooms}</table>
+  <h2>Payment</h2><table>
+    <tr><td>Channel</td><td>${esc(CHANNEL_NAMES[b.payment.channel] || b.payment.channel)}</td></tr>
+    <tr><td>Reference #</td><td>${esc(b.payment.referenceNumber)}</td></tr>
+    <tr><td>Grand total</td><td>${esc(peso(b.payment.grandTotal))}</td></tr>
+    <tr><td>${b.payment.channel === "cash" ? "To pay on arrival" : "Amount sent"}</td><td>${esc(peso(b.payment.channel === "cash" ? b.payment.grandTotal : b.payment.amount))}</td></tr>
+  </table>
+  <form method="post"><button class="btn${action === "issue" ? " issue" : ""}" type="submit">${esc(a.button)}</button></form>
+  <p class="note">Opening this page changes nothing. Only the button above does.</p>
+</div>`);
+});
+
+app.post("/staff/booking/:token", adminLimiter, async (req, res) => {
+  const r = readStaffRequest(req, res);
+  if (!r) return;
+  const { b, action, contactId } = r;
+  const key = `${b.id}:${action}`;
+  const done = confirmedActions.get(key);
+  if (typeof done === "object") return confirmedPage(res, b, action, done, true);
+  if (done) return errorPage(res, 409, "This confirmation is already in progress. Refresh in a moment.");
+
+  const webhook = GHL_ACTION_WEBHOOKS[action];
+  if (!webhook) return errorPage(res, 503, "This GHL workflow is not set up on the server yet.");
+
+  // Staff receipt (/receipt) and the guest's copy (/guest-receipt): same booking, sealed as different kinds.
+  const s = { action, verifiedAt: new Date().toISOString() };
+  const receiptFor = (kind) => (action === "issue" ? "" : `${PUBLIC_API_URL}/${kind}/${sealLink(kind, { b, s }, RECEIPT_TTL_MS)}`);
+  const links = { receipt: receiptFor("receipt"), guest: receiptFor("guest-receipt") };
+
+  confirmedActions.set(key, true); // pending: a double click waits for this one
+  try {
+    const url = new URL(webhook);
+    url.searchParams.set("contact_id", contactId); // the workflows' Find Contact reads this
+    url.searchParams.set("booking_id", b.id);
+    url.searchParams.set("receipt_link", links.receipt);
+    url.searchParams.set("guest_receipt_link", links.guest); // for the guest's GHL email
+    const response = await fetch(url, { method: "POST", signal: AbortSignal.timeout(15000) });
+    if (!response.ok) throw new Error(`GHL responded ${response.status}`);
+  } catch (err) {
+    confirmedActions.delete(key); // nothing recorded, so a retry is safe
+    console.error("[Staff Confirm] GHL webhook failed:", b.id, action, err.message);
+    return errorPage(res, 502, "Could not update GHL. Nothing was changed. Please try again.");
+  }
+
+  if (confirmedActions.size > MAX_CONFIRMED) confirmedActions.delete(confirmedActions.keys().next().value);
+  confirmedActions.set(key, links);
+  console.log("[Staff Confirm]", b.id, action);
+  confirmedPage(res, b, action, links, false);
+});
+
+// Staff receipt (/receipt) and the guest's copy (/guest-receipt). The guest copy
+// leaves out staff-only details: phone, email, birth date and the check-in checklist.
+function receiptRoute(kind, forGuest) {
+  return (req, res) => {
+    if (!linksEnabled()) return errorPage(res, 503, "Receipts are not set up on the server yet (RECEIPT_SECRET).");
+    const sealed = openLink(kind, req.params.token);
+    if (!sealed || !STAFF_ACTIONS[sealed.s?.action]?.badge) {
+      secLog(req, "invalid staff or receipt link");
+      return errorPage(res, 400, forGuest ? "This receipt link is invalid or expired. Please message HaidoVille on Facebook for a new one." : INVALID_LINK);
+    }
+    const { b, s } = sealed;
+    const paid = paidFor(b, s.action);
+    const balance = b.payment.grandTotal - paid;
+    const rows = bookingRows(b);
+    const guestRows = forGuest
+      ? `<tr><td>Name</td><td>${esc(b.guest.name)}</td></tr>`
+      : `${rows.guest}<tr><td>Birth date</td><td>${esc(b.guest.birthDate)} (age ${esc(b.guest.age)})</td></tr>`;
+    const after = forGuest
+      ? `<div class="notice"><strong>Before you arrive</strong><ul>
+          ${balance > 0 ? `<li>Please settle the balance of ${esc(peso(balance))} at check-in.</li>` : ""}
+          <li>Questions? Call or text 0997-958-3579, or message us on Facebook with your Booking ID.</li>
+        </ul></div>`
+      : `<h2>Check-in checklist</h2>
+        <ul class="check">
+          <li>Valid ID matches the name and birth date (18+)</li>
+          ${balance > 0 ? `<li>Balance of ${esc(peso(balance))} collected</li>` : ""}
+        </ul>`;
+    sendPage(res, 200, `Receipt ${b.id}`, `<div class="band"><small>BOOKING RECEIPT</small><strong>${esc(b.id)}</strong></div>
+<div class="body">
+  <span class="badge">${esc(STAFF_ACTIONS[s.action].badge)}</span>
+  <p style="margin-top:10px">Payment ${forGuest ? "confirmed" : "verified"} on ${esc(fmtManilaTime(s.verifiedAt))} · Booked on ${esc(fmtManilaTime(b.at))}</p>
+  <div class="id-alert">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2"/><circle cx="8.5" cy="11" r="2.2"/><path d="M5.5 16c.6-1.6 1.7-2.4 3-2.4s2.4.8 3 2.4M14 10h4.5M14 13.5h3"/></svg>
+    <div>${forGuest
+      ? `<b>Bring a valid ID</b><span>The person who made this booking must be <strong>18 or older</strong> and present a <strong>valid ID</strong> matching the name on this receipt at check-in.</span>`
+      : `<b>Check the booker's valid ID</b><span>The name and birth date on the ID must match this receipt (born ${esc(b.guest.birthDate)}, age ${esc(b.guest.age)}). The booker must be <strong>18 or older</strong>. If it does not match, do not cancel; flag it for review.</span>`}</div>
+  </div>
+  <h2>Guest</h2><table>${guestRows}</table>
+  ${forGuest ? "" : `<p style="font-size:12px;margin-top:8px">Confirmed 18+ and the ID requirement on ${esc(b.guest.ageConfirmedAt ? fmtManilaTime(b.guest.ageConfirmedAt) : "—")}</p>`}
+  <h2>Stay</h2><table class="rooms">${rows.rooms}</table>
+  <h2>Payment</h2><table>
+    <tr><td>Channel</td><td>${esc(CHANNEL_NAMES[b.payment.channel] || b.payment.channel)}</td></tr>
+    <tr><td>Reference #</td><td>${esc(b.payment.referenceNumber)}</td></tr>
+    <tr><td>Grand total</td><td>${esc(peso(b.payment.grandTotal))}</td></tr>
+    <tr><td>Amount paid</td><td>${esc(peso(paid))}</td></tr>
+    <tr class="total"><td>Balance due at check-in</td><td>${esc(peso(balance))}</td></tr>
+  </table>
+  ${after}
+  <button class="btn noprint" id="print" type="button">Print receipt</button>
+</div>`, { script: PRINT_SCRIPT, footer: forGuest ? GUEST_FOOTER : STAFF_FOOTER });
+  };
+}
+
+app.get("/receipt/:token", adminLimiter, receiptRoute("receipt", false));
+app.get("/guest-receipt/:token", adminLimiter, receiptRoute("guest-receipt", true));
+
+// ============================================================
 // POST /inquiry — Proxy for GHL Inquiry Webhook
 // ============================================================
 const INQUIRY_ALLOWED_FIELDS = [
@@ -1045,7 +1434,7 @@ async function createSmoobuDraft(data) {
         price: pricePerUnit,
         priceStatus: 0,
         // "Ref: <ref>" is parsed back by seedRefsFromSmoobu() — keep the format.
-        notice: `[WEBSITE ${data.bookingId}] ${data.payment.type.toUpperCase()} ₱${data.payment.amount} OF ₱${data.payment.grandTotal} |${data.payment.channel.toUpperCase()} | Ref: ${data.payment.referenceNumber} | ${data.payment.channel === "cash" ? "WALK-IN — CASH ON ARRIVAL" : "AWAITING RECEIPT VERIFICATION"}${bedSuffix ? " | " + bedSuffix.trim() : ""}`,
+        notice: `[WEBSITE ${data.bookingId}] ${data.payment.type.toUpperCase()} ₱${data.payment.amount} OF ₱${data.payment.grandTotal} |${data.payment.channel.toUpperCase()} | Ref: ${data.payment.referenceNumber} | ${data.payment.channel === "cash" ? "WALK-IN — CASH ON ARRIVAL" : "AWAITING RECEIPT VERIFICATION"}${bedSuffix ? " | " + bedSuffix.trim() : ""} | CHECK ID 18+`,
         language: "en",
       };
 
@@ -1074,22 +1463,8 @@ async function createSmoobuDraft(data) {
 async function sendBookingEmail(data) {
   if (!RESEND_API_KEY) return;
 
-  const esc = (s) =>
-    String(s ?? "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#x27;");
-
   const resend = new Resend(RESEND_API_KEY);
-  const channelNames = {
-    gcash: "GCash",
-    maya: "Maya",
-    metro: "Metrobank",
-    land: "Landbank",
-    cash: "Cash on Arrival (Walk-in)",
-  };
+  const channelNames = CHANNEL_NAMES;
   const payTypeNames = { full: "Full Payment", dp: "Downpayment" };
   const isCash = data.payment.channel === "cash";
   // Only "attack" is flagged: a "suspicious" score fits a real guest (a typo, a stale page).
@@ -1130,6 +1505,7 @@ async function sendBookingEmail(data) {
         <p style="margin:4px 0;"><strong>Name:</strong> ${esc(data.guest.name)}</p>
         <p style="margin:4px 0;"><strong>Email:</strong> ${esc(data.guest.email)}</p>
         <p style="margin:4px 0;"><strong>Phone:</strong> ${esc(data.guest.phone)}</p>
+        <p style="margin:4px 0;"><strong>Date of Birth:</strong> ${esc(data.guest.birthDate)} (age ${esc(data.guest.age)})</p>
         ${data.guest.nationality ? `<p style="margin:4px 0;"><strong>Nationality:</strong> ${esc(data.guest.nationality)}</p>` : ""}
         ${data.guest.address ? `<p style="margin:4px 0;"><strong>Address:</strong> ${esc(data.guest.address)}</p>` : ""}
         ${data.guest.arrivalTime ? `<p style="margin:4px 0;"><strong>Arrival Time:</strong> ${esc(data.guest.arrivalTime)}</p>` : ""}
@@ -1146,6 +1522,9 @@ async function sendBookingEmail(data) {
         <p style="margin:4px 0;"><strong>Balance on Check-in:</strong> ₱${(data.payment.grandTotal - data.payment.amount).toLocaleString()}</p>
         <div style="background:#fff;border-left:4px solid #C9A96E;padding:12px;margin-top:20px;border-radius:4px;">
           ${actionNeededHtml}
+        </div>
+        <div style="background:#fff;border-left:4px solid #C9A96E;padding:12px;margin-top:12px;border-radius:4px;">
+          <strong>🪪 Check the booker's valid ID (18+) at check-in.</strong><br>The name and date of birth must match this booking. If they do not match, do not cancel; flag it for review.
         </div>
       </div>
     </div>
@@ -1184,14 +1563,7 @@ function buildGhlPayload(data) {
   const nameParts = (data.guest.name || "").trim().split(/\s+/);
   const firstName = nameParts[0] || "";
   const lastName = nameParts.slice(1).join(" ") || "";
-  const channelLabels = {
-    gcash: "GCash/PayMaya",
-    maya: "GCash/PayMaya",
-    metro: "Metrobank",
-    land: "Landbank",
-    cash: "Cash on Arrival (Walk-in)",
-  };
-  const paymentMethod = channelLabels[data.payment.channel] || data.payment.channel;
+  const paymentMethod = CHANNEL_NAMES[data.payment.channel] || data.payment.channel;
   const firstRoom = data.rooms[0] || {};
 
   const fmtShortDate = (d) => {
@@ -1269,6 +1641,11 @@ function buildGhlPayload(data) {
     payment_type: data.payment.type === "full" ? "Full Payment" : "Downpayment",
     special_request: data.guest.specialRequest || "",
     room_count: String(data.rooms.length),
+    // Staff buttons in the payment-check email: {{contact.staff_link}}?action=dp&contact_id={{contact.id}}
+    staff_link: staffLink(data),
+    payment_status: paymentStatus(data.payment),
+    birth_date: data.guest.birthDate || "",
+    age_confirmed_at: data.guest.ageConfirmedAt ? fmtManilaTime(data.guest.ageConfirmedAt) : "",
     all_rooms: data.rooms.map((r) => ({
       name: r.name,
       check_in: fmtShortDate(r.checkIn),
@@ -1304,6 +1681,10 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     console.log(`   Email:         ${RESEND_API_KEY && ADMIN_EMAIL ? "✅" : "⚠️  disabled"}`);
     console.log(`   GHL Webhook:   ${GHL_WEBHOOK_URL ? "✅" : "⚠️  not configured"}`);
     console.log(`   Smoobu Drafts: ${CREATE_SMOOBU_DRAFT ? "✅ ON" : "❌ OFF"}`);
+    console.log(`   Receipts:      ${linksEnabled() ? "✅" : "⚠️  RECEIPT_SECRET not set: no staff or receipt links"}`);
+    for (const [action, url] of Object.entries(GHL_ACTION_WEBHOOKS)) {
+      if (!url) console.warn(`   ⚠️  GHL webhook for "${action}" not set: staff can't confirm that action`);
+    }
   });
   seedRefsFromSmoobu()
     .then((n) => console.log(`[Refs] Restored ${n} payment reference(s) from Smoobu.`))
