@@ -105,6 +105,18 @@ setInterval(rotateJwtKeys, JWT_ROTATE_MS).unref();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// Phone in E.164 ("+639171234567"), or null. PH mobiles: 09…, 639…, +639….
+// Foreign numbers need "+" and the country code.
+// ponytail: foreign numbers only get a length check; use libphonenumber-js if GHL still rejects some.
+const PHONE_MSG = "Please enter a valid mobile number (e.g. 0917 123 4567 or +63 917 123 4567).";
+function normalizePhone(raw) {
+  const s = String(raw ?? "").replace(/[\s().-]/g, "");
+  if (/^09\d{9}$/.test(s)) return "+63" + s.slice(1);
+  if (/^639\d{9}$/.test(s)) return "+" + s;
+  if (s.startsWith("+63")) return /^\+639\d{9}$/.test(s) ? s : null;
+  return /^\+[1-9]\d{7,14}$/.test(s) ? s : null;
+}
+
 // HTML-escape guest text for emails and pages.
 const esc = (s) =>
   String(s ?? "")
@@ -115,6 +127,10 @@ const esc = (s) =>
     .replace(/'/g, "&#x27;");
 
 const CHANNEL_NAMES = { gcash: "GCash", maya: "Maya", metro: "Metrobank", land: "Landbank", cash: "Cash on Arrival (Walk-in)" };
+const PAY_TYPE_NAMES = { full: "Full Payment", dp: "Downpayment", cash: "Cash on Arrival" };
+// Family Room for 6–7 guests needs HaidoVille's approval. "" when nothing needs it.
+const approvalNote = (rooms) => rooms.filter((r) => r.name.startsWith("Family Room") && r.pax > 5)
+  .map((r) => `${r.name} for ${r.pax} guests needs approval`).join("; ");
 const peso = (n) => "₱" + Number(n || 0).toLocaleString("en-US");
 // "2026-11-14" -> "Nov 14, 2026"
 const fmtDay = (ymd) => new Date(ymd + "T00:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" });
@@ -256,19 +272,18 @@ function calculateRoomPrice(roomName, pax, nights, checkIn, checkOut) {
   switch (roomName) {
     case "Bunk Beds": {
       if (pax < 1 || pax > 6) throw new Error("Bunk Beds max is 6 beds.");
+      // ₱600/head/night for 1–2 nights, ₱500 for 3+; Holy Week nights +₱100.
+      const rate = nights <= 2 ? 600 : 500;
       if (checkIn && checkOut) {
         let total = 0;
         const start = new Date(checkIn + "T00:00:00");
-        const end = new Date(checkOut + "T00:00:00");
-        const msPerDay = 86400000;
-        const numNights = Math.round((end - start) / msPerDay);
-        for (let i = 0; i < numNights; i++) {
-          const night = new Date(start.getTime() + i * msPerDay);
-          total += (isHolyWeekDate(night) ? 600 : 500) * pax;
+        for (let i = 0; i < nights; i++) {
+          const night = new Date(start.getTime() + i * 86400000);
+          total += (rate + (isHolyWeekDate(night) ? 100 : 0)) * pax;
         }
         return total;
       }
-      return 500 * pax * nights;
+      return rate * pax * nights;
     }
     case "Couple Room":
       if (pax <= 2) return 1200 * nights;
@@ -280,9 +295,10 @@ function calculateRoomPrice(roomName, pax, nights, checkIn, checkOut) {
       throw new Error("Barkada Room pax must be 6–9.");
     case "Family Room 1":
     case "Family Room 2":
+      // 5 standard; 6–7 only with HaidoVille's approval, at ₱500/head.
       if (pax >= 1 && pax <= 5) return 2500 * nights;
-      if (pax === 6) return 3000 * nights;
-      throw new Error("Family Room max pax is 6.");
+      if (pax <= 7) return 500 * pax * nights;
+      throw new Error("Family Room max pax is 7.");
     default:
       throw new Error(`Unknown room: ${roomName}`);
   }
@@ -817,6 +833,8 @@ app.post(
       if (!EMAIL_RE.test(sanitizedGuest.email)) {
         return res.status(400).json({ error: "Invalid email address." });
       }
+      sanitizedGuest.phone = normalizePhone(sanitizedGuest.phone);
+      if (!sanitizedGuest.phone) return res.status(400).json({ error: PHONE_MSG });
 
       // The page only gets here after verify-booker, so a failure means a tampered request.
       const ageError = bookerError(rawData.guest.birthDate, rawData.guest.ageConfirmed);
@@ -898,19 +916,16 @@ app.post(
         return res.status(400).json({ error: "Price mismatch. Please refresh the page and try again." });
       }
 
-      // Downpayment: any whole-peso amount from 50% (rounded up) to 100% of the total.
-      // Paying 100% counts as full payment.
+      // "Amount already paid", as the guest says: cash on arrival is ₱0; otherwise any
+      // whole-peso amount from 50% (rounded up) to 100% of the total. Nothing counts as
+      // paid until Thor verifies it on the staff page.
       const minDownpayment = Math.ceil(calculatedGrandTotal * 0.5);
-      const finalAmountPaid = Number(rawData.payment.amount);
-      const wantsFull = String(rawData.payment.type) === "full";
-      if (!Number.isInteger(finalAmountPaid) || finalAmountPaid > calculatedGrandTotal ||
-          finalAmountPaid < (wantsFull ? calculatedGrandTotal : minDownpayment)) {
+      const finalAmountPaid = isCash ? 0 : Number(rawData.payment.amount);
+      if (!isCash && (!Number.isInteger(finalAmountPaid) || finalAmountPaid > calculatedGrandTotal || finalAmountPaid < minDownpayment)) {
         secLog(req, "booking price mismatch");
-        return res.status(400).json({ error: wantsFull
-          ? "Price mismatch. Please refresh the page and try again."
-          : `Downpayment must be a whole amount from ₱${minDownpayment.toLocaleString()} (50%) to ₱${calculatedGrandTotal.toLocaleString()}.` });
+        return res.status(400).json({ error: `Amount already paid must be a whole amount from ₱${minDownpayment.toLocaleString()} (50%) to ₱${calculatedGrandTotal.toLocaleString()}.` });
       }
-      const paymentType = finalAmountPaid === calculatedGrandTotal ? "full" : "dp";
+      const paymentType = isCash ? "cash" : finalAmountPaid === calculatedGrandTotal ? "full" : "dp";
 
       const source = BOOKING_SOURCES.includes(rawData.source) ? rawData.source : BOOKING_SOURCES[0];
 
@@ -933,9 +948,8 @@ app.post(
             channel: paymentChannel,
             type: paymentType,
             referenceNumber: isCash ? `CASH-${Date.now()}` : clientRef,
-            amount: finalAmountPaid,
+            amount: finalAmountPaid, // claimed by the guest, not verified
             grandTotal: calculatedGrandTotal,
-            balance: calculatedGrandTotal - finalAmountPaid,
           },
         };
 
@@ -981,8 +995,8 @@ app.post(
         success: true,
         bookingId: data.bookingId,
         message: isCash
-          ? "Booking confirmed! Please pay in cash upon arrival."
-          : "Booking reserved. Please complete payment.",
+          ? "Booking request received. Please pay in cash upon arrival."
+          : "Booking request received. HaidoVille will verify your payment.",
       });
     } catch (err) {
       console.error("[Booking Create Error]", err.message);
@@ -1034,8 +1048,13 @@ function paymentStatus(p) {
   return `${p.type === "full" ? "Full payment" : "Downpayment"} ${peso(p.amount)} sent — awaiting verification`;
 }
 
-// What a confirmed action means for the money: "full" = the whole total is in.
-const paidFor = (b, action) => (action === "full" ? b.payment.grandTotal : b.payment.amount);
+// Amount box on the confirm page: the DP the guest claimed, or what's left for "full".
+const suggestedAmount = (b, action) => (action === "dp" ? b.payment.amount
+  : b.payment.grandTotal - (b.payment.type === "dp" ? b.payment.amount : 0));
+
+// What a confirmed action means for the money: "full" = the whole total is in;
+// "dp" = the amount Thor verified (older links have none: the claimed DP).
+const paidFor = (b, s) => (s.action === "full" ? b.payment.grandTotal : s.amount ?? b.payment.amount);
 
 // bookingId:action -> { receipt, guest } links ("" for issue). `true` = pending, blocks a double click.
 // ponytail: in memory only; after a restart a repeat confirm calls GHL again
@@ -1178,14 +1197,19 @@ app.get("/staff/booking/:token", adminLimiter, (req, res) => {
     <tr><td>Channel</td><td>${esc(CHANNEL_NAMES[b.payment.channel] || b.payment.channel)}</td></tr>
     <tr><td>Reference #</td><td>${esc(b.payment.referenceNumber)}</td></tr>
     <tr><td>Grand total</td><td>${esc(peso(b.payment.grandTotal))}</td></tr>
-    <tr><td>${b.payment.channel === "cash" ? "To pay on arrival" : "Amount sent"}</td><td>${esc(peso(b.payment.channel === "cash" ? b.payment.grandTotal : b.payment.amount))}</td></tr>
+    <tr><td>${b.payment.channel === "cash" ? "To pay on arrival" : "Guest says they sent"}</td><td>${esc(peso(b.payment.channel === "cash" ? b.payment.grandTotal : b.payment.amount))}</td></tr>
   </table>
-  <form method="post"><button class="btn${action === "issue" ? " issue" : ""}" type="submit">${esc(a.button)}</button></form>
+  <form method="post">${action === "issue" ? "" : `
+    <h2><label for="amount">Amount you verified (₱)</label></h2>
+    <input id="amount" name="amount" inputmode="numeric" required pattern="[0-9,]+" value="${esc(suggestedAmount(b, action) || "")}"
+      style="width:100%;padding:12px 14px;font:700 18px Arial,sans-serif;border:1px solid var(--line);border-radius:12px">
+    <p class="note" style="text-align:left">Pre-filled with ${action === "dp" ? "what the guest says they paid" : "the rest of the total"}. Change it if your GCash or bank app shows a different amount.</p>`}
+    <button class="btn${action === "issue" ? " issue" : ""}" type="submit">${esc(a.button)}</button></form>
   <p class="note">Opening this page changes nothing. Only the button above does.</p>
 </div>`);
 });
 
-app.post("/staff/booking/:token", adminLimiter, async (req, res) => {
+app.post("/staff/booking/:token", adminLimiter, express.urlencoded({ extended: false, limit: "2kb" }), async (req, res) => {
   const r = readStaffRequest(req, res);
   if (!r) return;
   const { b, action, contactId } = r;
@@ -1197,8 +1221,14 @@ app.post("/staff/booking/:token", adminLimiter, async (req, res) => {
   const webhook = GHL_ACTION_WEBHOOKS[action];
   if (!webhook) return errorPage(res, 503, "This GHL workflow is not set up on the server yet.");
 
+  // The amount Thor checked in GCash / the bank. GHL adds it to Verified Paid Total.
+  const amount = Number(String(req.body?.amount ?? "").replace(/,/g, ""));
+  if (action !== "issue" && !(Number.isInteger(amount) && amount >= 1 && amount <= b.payment.grandTotal)) {
+    return errorPage(res, 400, `Enter the amount you verified, in whole pesos from ₱1 to ${peso(b.payment.grandTotal)}. Go back and try again.`);
+  }
+
   // Staff receipt (/receipt) and the guest's copy (/guest-receipt): same booking, sealed as different kinds.
-  const s = { action, verifiedAt: new Date().toISOString() };
+  const s = { action, verifiedAt: new Date().toISOString(), ...(action !== "issue" && { amount }) };
   const receiptFor = (kind) => (action === "issue" ? "" : `${PUBLIC_API_URL}/${kind}/${sealLink(kind, { b, s }, RECEIPT_TTL_MS)}`);
   const links = { receipt: receiptFor("receipt"), guest: receiptFor("guest-receipt") };
 
@@ -1209,6 +1239,7 @@ app.post("/staff/booking/:token", adminLimiter, async (req, res) => {
     url.searchParams.set("booking_id", b.id);
     url.searchParams.set("receipt_link", links.receipt);
     url.searchParams.set("guest_receipt_link", links.guest); // for the guest's GHL email
+    if (s.amount) url.searchParams.set("verified_amount", String(s.amount)); // GHL Math steps
     const response = await fetch(url, { method: "POST", signal: AbortSignal.timeout(15000) });
     if (!response.ok) throw new Error(`GHL responded ${response.status}`);
   } catch (err) {
@@ -1234,7 +1265,7 @@ function receiptRoute(kind, forGuest) {
       return errorPage(res, 400, forGuest ? "This receipt link is invalid or expired. Please message HaidoVille on Facebook for a new one." : INVALID_LINK);
     }
     const { b, s } = sealed;
-    const paid = paidFor(b, s.action);
+    const paid = paidFor(b, s);
     const balance = b.payment.grandTotal - paid;
     const rows = bookingRows(b);
     const guestRows = forGuest
@@ -1295,7 +1326,8 @@ function validateInquiry(body) {
   const f = {};
   for (const k of INQUIRY_ALLOWED_FIELDS) f[k] = String(body[k] ?? "").replace(/[<>]/g, "").trim().slice(0, 1000);
   if (!f.full_name || f.full_name.length > 100) return "Please enter your name.";
-  if (!/^[0-9+()\-\s]{7,20}$/.test(f.phone)) return "Please enter a valid phone number.";
+  f.phone = normalizePhone(f.phone);
+  if (!f.phone) return PHONE_MSG;
   if (f.email.length > 100 || !EMAIL_RE.test(f.email)) return "Please enter a valid email address.";
   if (!isValidDate(f.quote_checkin_date) || !isValidDate(f.quote_checkout_date) ||
       f.quote_checkout_date <= f.quote_checkin_date) return "Please check your dates.";
@@ -1434,7 +1466,7 @@ async function createSmoobuDraft(data) {
         price: pricePerUnit,
         priceStatus: 0,
         // "Ref: <ref>" is parsed back by seedRefsFromSmoobu() — keep the format.
-        notice: `[WEBSITE ${data.bookingId}] ${data.payment.type.toUpperCase()} ₱${data.payment.amount} OF ₱${data.payment.grandTotal} |${data.payment.channel.toUpperCase()} | Ref: ${data.payment.referenceNumber} | ${data.payment.channel === "cash" ? "WALK-IN — CASH ON ARRIVAL" : "AWAITING RECEIPT VERIFICATION"}${bedSuffix ? " | " + bedSuffix.trim() : ""} | CHECK ID 18+`,
+        notice: `[WEBSITE ${data.bookingId}] ${data.payment.channel === "cash" ? "₱0 PAID" : `GUEST SAYS PAID ₱${data.payment.amount} (UNVERIFIED)`} OF ₱${data.payment.grandTotal} |${data.payment.channel.toUpperCase()} | Ref: ${data.payment.referenceNumber} | ${data.payment.channel === "cash" ? "WALK-IN — CASH ON ARRIVAL" : "AWAITING RECEIPT VERIFICATION"}${bedSuffix ? " | " + bedSuffix.trim() : ""}${approvalNote(data.rooms) ? " | " + approvalNote(data.rooms).toUpperCase() : ""} | CHECK ID 18+`,
         language: "en",
       };
 
@@ -1465,8 +1497,8 @@ async function sendBookingEmail(data) {
 
   const resend = new Resend(RESEND_API_KEY);
   const channelNames = CHANNEL_NAMES;
-  const payTypeNames = { full: "Full Payment", dp: "Downpayment" };
   const isCash = data.payment.channel === "cash";
+  const approval = approvalNote(data.rooms);
   // Only "attack" is flagged: a "suspicious" score fits a real guest (a typo, a stale page).
   const risky = data.risk && data.risk.level === "attack";
   const riskHtml = risky
@@ -1501,6 +1533,7 @@ async function sendBookingEmail(data) {
       </div>
       <div style="background:#f9f9f9;padding:20px;border-radius:0 0 12px 12px;">
         ${riskHtml}
+        ${approval ? `<div style="background:#fff8e6;border-left:4px solid #f59e0b;padding:12px;margin-bottom:16px;border-radius:4px;"><strong>⚠️ Needs approval:</strong> ${esc(approval)}.</div>` : ""}
         <h3 style="margin-top:0;color:#C9A96E;">👤 Guest Details</h3>
         <p style="margin:4px 0;"><strong>Name:</strong> ${esc(data.guest.name)}</p>
         <p style="margin:4px 0;"><strong>Email:</strong> ${esc(data.guest.email)}</p>
@@ -1514,12 +1547,12 @@ async function sendBookingEmail(data) {
         <h3 style="color:#C9A96E;margin-top:20px;">🛏️ Rooms</h3>
         <table style="width:100%;border-collapse:collapse;">${roomsHtml}</table>
         <h3 style="color:#C9A96E;margin-top:20px;">💰 Payment Details (Server Verified)</h3>
-        <p style="margin:4px 0;"><strong>Type:</strong> ${payTypeNames[data.payment.type]}</p>
+        <p style="margin:4px 0;"><strong>Type:</strong> ${PAY_TYPE_NAMES[data.payment.type]}</p>
         <p style="margin:4px 0;"><strong>Channel:</strong> ${channelNames[data.payment.channel]}</p>
         <p style="margin:4px 0;"><strong>Reference #:</strong> <code style="background:#fff;padding:3px 8px;border-radius:4px;">${esc(data.payment.referenceNumber)}</code></p>
-        <p style="margin:4px 0;"><strong>Amount Paid:</strong> <span style="color:#C9A96E;font-size:18px;font-weight:bold;">₱${data.payment.amount.toLocaleString()}</span></p>
+        <p style="margin:4px 0;"><strong>Amount guest says paid (not verified):</strong> <span style="color:#C9A96E;font-size:18px;font-weight:bold;">₱${data.payment.amount.toLocaleString()}</span></p>
         <p style="margin:4px 0;"><strong>Grand Total:</strong> ₱${data.payment.grandTotal.toLocaleString()}</p>
-        <p style="margin:4px 0;"><strong>Balance on Check-in:</strong> ₱${(data.payment.grandTotal - data.payment.amount).toLocaleString()}</p>
+        <p style="margin:4px 0;"><strong>Balance:</strong> ₱${data.payment.grandTotal.toLocaleString()} (nothing verified yet)</p>
         <div style="background:#fff;border-left:4px solid #C9A96E;padding:12px;margin-top:20px;border-radius:4px;">
           ${actionNeededHtml}
         </div>
@@ -1535,7 +1568,7 @@ async function sendBookingEmail(data) {
     from: `HaidoVille Booking <${FROM_EMAIL}>`,
     to: ADMIN_EMAIL,
     replyTo: data.guest.email,
-    subject: `${risky ? "[CHECK] " : ""}🏠 Verified Booking: ${data.bookingId} — ${safeSubjectName}${isCash ? " [WALK-IN/CASH]" : ""}`,
+    subject: `${risky ? "[CHECK] " : ""}${approval ? "[NEEDS APPROVAL] " : ""}🏠 New Booking: ${data.bookingId} — ${safeSubjectName}${isCash ? " [WALK-IN/CASH]" : ""}`,
     html,
   });
 
@@ -1590,8 +1623,7 @@ function buildGhlPayload(data) {
   };
 
   const grandTotal = data.payment.grandTotal || 0;
-  const dpAmount = data.payment.amount;
-  const balance = grandTotal - dpAmount;
+  const dpAmount = data.payment.amount; // claimed by the guest; Thor's verified payments lower the balance in GHL
   // Multi-room stays can have different dates: the email shows the whole stay
   // (earliest check-in to latest check-out), and each room's own dates when they differ.
   const stayIn = data.rooms.map((r) => r.checkIn).sort()[0];
@@ -1637,8 +1669,12 @@ function buildGhlPayload(data) {
     payment_ref: data.payment.referenceNumber || "",
     total_amount: String(grandTotal),
     dp_amount: String(dpAmount),
-    balance: String(balance),
-    payment_type: data.payment.type === "full" ? "Full Payment" : "Downpayment",
+    balance: String(grandTotal), // nothing is verified yet
+    // Number fields for the GHL Math steps in Mark DP / Payment Received.
+    balance_number: grandTotal,
+    verified_paid_total: 0,
+    payment_type: PAY_TYPE_NAMES[data.payment.type],
+    needs_approval: approvalNote(data.rooms),
     special_request: data.guest.specialRequest || "",
     room_count: String(data.rooms.length),
     // Staff buttons in the payment-check email: {{contact.staff_link}}?action=dp&contact_id={{contact.id}}
@@ -1669,7 +1705,7 @@ app.use((err, req, res, next) => {
 });
 
 export {
-  app, calculateRoomPrice, isValidDate, getEaster, isHolyWeekDate, buildAvailabilityResult,
+  app, calculateRoomPrice, normalizePhone, isValidDate, getEaster, isHolyWeekDate, buildAvailabilityResult,
   seedRefsFromSmoobu, sendBookingEmail, buildGhlPayload,
 };
 
