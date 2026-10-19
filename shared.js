@@ -27,9 +27,11 @@ const EVENT_WEIGHT = {
   "invalid booking token": 10,              // forged or tampered JWT
   "booking token reused": 10,               // replay
   "bad session hint signature": 5,
+  "invalid staff or receipt link": 5,       // links are sealed; only a forged or edited one fails
   "invalid inquiry CSRF token": 5,
   "upload rejected: not a JPEG/PNG/WebP image": 5,
   "many bookings from one IP": 5,
+  "booker age details tampered": 10,        // only a forged request gets past the page's age check
   "booking price mismatch": 4,              // tampering, or a stale page
   "session used from a different user-agent": 4,
   "rate limit hit": 3,
@@ -37,6 +39,7 @@ const EVENT_WEIGHT = {
   "guest-access blocked origin": 3,
   "per-guest daily booking cap": 3,
   "missing or invalid guest pass": 2,       // also: a pass that just expired
+  "missing or invalid booker pass": 2,      // also: a pass that just expired (30 min)
   "guest-access denied": 2,                 // also: a typo; 5 in a row is guessing
   "internal endpoint without key": 1,       // crawlers and scanners hit "/" all day
 };
