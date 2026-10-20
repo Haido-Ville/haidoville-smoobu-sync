@@ -148,7 +148,7 @@ router.get(
       const data = await ghlRes.json();
       const files = (data.files || [])
         .filter((f) => f.url && /\.(jpg|jpeg|png|gif|webp)$/i.test(f.name || f.url)) // no SVG: it can carry script
-        .map((f) => ({ url: f.url, name: f.name || "Guest photo" }));
+        .map((f) => ({ url: f.url, name: f.name || "Guest photo", createdAt: f.createdAt })); // createdAt: month headers in the app gallery
 
       res.json({ files });
     } catch (err) {
