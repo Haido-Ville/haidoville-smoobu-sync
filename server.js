@@ -780,7 +780,8 @@ function withBookingLock(fn) {
   return run;
 }
 
-const VALID_CHANNELS = ["gcash", "maya", "metro", "land", "cash"];
+// Cash is walk-in only, not a website booking (old cash bookings still render below).
+const VALID_CHANNELS = ["gcash", "maya", "metro", "land"];
 const BOOKING_SOURCES = ["Website (Direct)"];
 const MAX_BOOKINGS_PER_GUEST_PER_DAY = 3;
 const REF_RE = /^[A-Z0-9-]{5,30}$/;
