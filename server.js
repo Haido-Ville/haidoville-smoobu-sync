@@ -29,6 +29,7 @@ import { v4 as uuidv4 } from "uuid";
 import { generateHint, verifyHint, HINT_TTL_MS, sealLink, openLink } from "./encryption.js";
 import { limiter, secLog, safeEqual, smoobuFetch, fetchReservations, recordBooking, securityStatus } from "./shared.js";
 import appServerRouter, { setSessionHintMiddleware } from "./appServer.js";
+import { getPromos, promoFeedMode } from "./promo.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -475,6 +476,7 @@ const tokenRateLimiter = limiter(60 * 1000, 20);
 const pingRateLimiter = limiter(60 * 1000, 12);
 const availabilityRateLimiter = limiter(60 * 1000, 30);
 const inquiryRateLimiter = limiter(15 * 60 * 1000, 5);
+const promoRateLimiter = limiter(60 * 1000, 30);
 
 // ============================================================
 // GET /ping — Public keep-alive endpoint (no auth)
@@ -694,6 +696,15 @@ app.get("/api/payment-methods", tokenRateLimiter, requireSessionHint, requireBoo
       landbank: { account: process.env.LANDBANK_ACCOUNT, owner: process.env.LANDBANK_OWNER }
     }
   });
+});
+
+// ============================================================
+// GET /api/haido-promo — Promo banner (public, cached; see promo.js)
+// ============================================================
+// Takes no input: no query param can force a feed call.
+app.get("/api/haido-promo", promoRateLimiter, async (req, res) => {
+  res.set("Cache-Control", "public, max-age=300");
+  res.json({ promos: await getPromos().catch(() => []) });
 });
 
 // ============================================================
@@ -1718,6 +1729,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     console.log(`   Email:         ${RESEND_API_KEY && ADMIN_EMAIL ? "✅" : "⚠️  disabled"}`);
     console.log(`   GHL Webhook:   ${GHL_WEBHOOK_URL ? "✅" : "⚠️  not configured"}`);
     console.log(`   Smoobu Drafts: ${CREATE_SMOOBU_DRAFT ? "✅ ON" : "❌ OFF"}`);
+    console.log(`   Promo feed:    ${promoFeedMode() ? `✅ ${promoFeedMode()}` : "⚠️  HAIDO_PROMO_FEED not set: no banner"}`);
     console.log(`   Receipts:      ${linksEnabled() ? "✅" : "⚠️  RECEIPT_SECRET not set: no staff or receipt links"}`);
     for (const [action, url] of Object.entries(GHL_ACTION_WEBHOOKS)) {
       if (!url) console.warn(`   ⚠️  GHL webhook for "${action}" not set: staff can't confirm that action`);
