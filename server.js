@@ -1,19 +1,6 @@
 // ============================================================
 // HAIDOVILLE × SMOOBU SYNC - Render.com Server v4.3
 // ============================================================
-// v4.3 CHANGES (security audit 2026-09-29):
-// - Rate limits keyed on the real client IP (CF-Connecting-IP).
-// - Booking lock covers the availability check + Smoobu draft,
-//   so two guests can't book the same room at once.
-// - Payment references normalised, time-based dedup, restored
-//   from Smoobu draft notices on startup.
-// - Stricter validation (reference numbers, inquiries), bounded
-//   in-memory stores, generic error responses, JSON error handler,
-//   no guest PII in logs, [SEC] security event logs.
-//
-// v4.2: Smoobu API auth uses HMAC-SHA256 signed requests
-//       (SMOOBU_API_LABEL + SMOOBU_API_SECRET).
-// ============================================================
 
 import express from "express";
 import helmet from "helmet";
@@ -106,9 +93,7 @@ setInterval(rotateJwtKeys, JWT_ROTATE_MS).unref();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-// Phone in E.164 ("+639171234567"), or null. PH mobiles: 09…, 639…, +639….
-// Foreign numbers need "+" and the country code.
-// ponytail: foreign numbers only get a length check; use libphonenumber-js if GHL still rejects some.
+// Phone in E.164 ("+639171234567"), or null.
 const PHONE_MSG = "Please enter a valid mobile number (e.g. 0917 123 4567 or +63 917 123 4567).";
 function normalizePhone(raw) {
   const s = String(raw ?? "").replace(/[\s().-]/g, "");
@@ -144,9 +129,6 @@ const isoDay = (offsetDays) => new Date(Date.now() + offsetDays * 86400000).toIS
 // ============================================================
 // PAYMENT REFERENCE STORE (Dedup)
 // ============================================================
-// Render's disk is wiped on every deploy/restart/spin-down, so the file only
-// covers the current uptime. seedRefsFromSmoobu() restores references from
-// Smoobu draft notices on startup (needs CREATE_SMOOBU_DRAFT=true).
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const REF_FILE = path.join(DATA_DIR, "processed_refs.json");
 const REF_TTL_MS = 180 * 24 * 60 * 60 * 1000;
@@ -234,8 +216,6 @@ function isValidDate(str) {
 }
 
 // ---- Booker age (18+) ----
-// The booker's age is always computed here from the birth date, on Manila's
-// calendar day. The age sent by the browser is never trusted.
 const UNDER_AGE_MSG = "The person making this booking must be 18 or older. Please ask an adult or guardian to book.";
 const BAD_DOB_MSG = "Please enter a valid date of birth.";
 const manilaToday = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Manila" }); // YYYY-MM-DD
@@ -445,9 +425,6 @@ const requireJwtToken = (req, res, next) => {
 };
 
 // ---- Booker pass ----
-// Issued by /booking/verify-booker once the booker is 18+. It carries the
-// verified birth date, so the booking can't swap in a different one later.
-// Payment details, the booking token and the booking itself all require it.
 const BOOKER_PASS_TTL = "30m";
 const signBookerPass = (birthDate) =>
   jwt.sign({ typ: "booker", bd: birthDate }, JWT_CURR_SEC, { expiresIn: BOOKER_PASS_TTL, algorithm: "HS256" });
@@ -782,8 +759,6 @@ app.get("/booking-token", tokenRateLimiter, requireSessionHint, requireBookerPas
 // ============================================================
 // POST /bookings/create
 // ============================================================
-// Bookings run one at a time, so the availability check and the Smoobu
-// draft that claims the room can't interleave with another booking.
 let bookingQueue = Promise.resolve();
 function withBookingLock(fn) {
   const run = bookingQueue.then(fn, fn);
@@ -928,9 +903,6 @@ app.post(
         return res.status(400).json({ error: "Price mismatch. Please refresh the page and try again." });
       }
 
-      // "Amount already paid", as the guest says: cash on arrival is ₱0; otherwise any
-      // whole-peso amount from 50% (rounded up) to 100% of the total. Nothing counts as
-      // paid until Thor verifies it on the staff page.
       const minDownpayment = Math.ceil(calculatedGrandTotal * 0.5);
       const finalAmountPaid = isCash ? 0 : Number(rawData.payment.amount);
       if (!isCash && (!Number.isInteger(finalAmountPaid) || finalAmountPaid > calculatedGrandTotal || finalAmountPaid < minDownpayment)) {
@@ -974,8 +946,6 @@ app.post(
         }
 
         // Claim the room in Smoobu before the lock is released.
-        // ponytail: with CREATE_SMOOBU_DRAFT=false nothing claims the room, so two
-        // guests can still both be accepted; staff resolve it manually.
         if (CREATE_SMOOBU_DRAFT && SMOOBU_API_LABEL && SMOOBU_API_SECRET) {
           await createSmoobuDraft(data).catch((err) => console.error("[Smoobu Draft Error]", err.message));
           cache = { data: null, timestamp: 0 };
@@ -1020,11 +990,6 @@ app.post(
 // ============================================================
 // STAFF PAYMENT CONFIRMATION + BOOKING RECEIPT
 // ============================================================
-// The payment-check email (GHL) links each button to
-//   /staff/booking/<sealed booking>?action=dp|full|issue&contact_id=<GHL id>
-// GET only shows a confirm page, so email scanners that open links change
-// nothing. POST calls the matching GHL workflow with a sealed receipt link.
-// No database: the booking travels inside the sealed link (encryption.js).
 const STAFF_LINK_TTL_MS = 60 * 24 * 60 * 60 * 1000;
 const RECEIPT_TTL_MS = 365 * 24 * 60 * 60 * 1000;
 const STAFF_ACTIONS = {
@@ -1064,18 +1029,13 @@ function paymentStatus(p) {
 const suggestedAmount = (b, action) => (action === "dp" ? b.payment.amount
   : b.payment.grandTotal - (b.payment.type === "dp" ? b.payment.amount : 0));
 
-// What a confirmed action means for the money: "full" = the whole total is in;
-// "dp" = the amount Thor verified (older links have none: the claimed DP).
+// Amount a confirmed action counts as paid.
 const paidFor = (b, s) => (s.action === "full" ? b.payment.grandTotal : s.amount ?? b.payment.amount);
 
 // bookingId:action -> { receipt, guest } links ("" for issue). `true` = pending, blocks a double click.
-// ponytail: in memory only; after a restart a repeat confirm calls GHL again
-// (GHL may re-send the receipt email). A database would remove this.
 const confirmedActions = new Map();
 const MAX_CONFIRMED = 5000;
 
-// Staff pages: no caching, no indexing, no referrer (the URL is the key), and a
-// CSP that allows only inline styles, our own form, the logo and one nonce script.
 const STAFF_FOOTER = "HaidoVille · Staff only · Don't forward this page outside the team.";
 const GUEST_FOOTER = "HaidoVille Vacation Home Rental · Tourism Road, Brgy. Poblacion 3, General Luna, Siargao Island";
 const PRINT_SCRIPT = 'document.getElementById("print").addEventListener("click", function () { window.print(); });';
@@ -1266,8 +1226,7 @@ app.post("/staff/booking/:token", adminLimiter, express.urlencoded({ extended: f
   confirmedPage(res, b, action, links, false);
 });
 
-// Staff receipt (/receipt) and the guest's copy (/guest-receipt). The guest copy
-// leaves out staff-only details: phone, email, birth date and the check-in checklist.
+// Staff receipt (/receipt) and the guest's copy (/guest-receipt).
 function receiptRoute(kind, forGuest) {
   return (req, res) => {
     if (!linksEnabled()) return errorPage(res, 503, "Receipts are not set up on the server yet (RECEIPT_SECRET).");
@@ -1390,8 +1349,6 @@ app.post(
 // ============================================================
 // HELPER: Availability check for a booking request
 // ============================================================
-// One Smoobu fetch for the whole request. Returns an error message for the
-// first room that can't be booked, or null. Fails safe if Smoobu is down.
 async function findUnavailableRoom(rooms) {
   const from = rooms.map((r) => r.checkIn).sort()[0];
   const to = rooms.map((r) => r.checkOut).sort().at(-1);
@@ -1636,8 +1593,6 @@ function buildGhlPayload(data) {
 
   const grandTotal = data.payment.grandTotal || 0;
   const dpAmount = data.payment.amount; // claimed by the guest; Thor's verified payments lower the balance in GHL
-  // Multi-room stays can have different dates: the email shows the whole stay
-  // (earliest check-in to latest check-out), and each room's own dates when they differ.
   const stayIn = data.rooms.map((r) => r.checkIn).sort()[0];
   const stayOut = data.rooms.map((r) => r.checkOut).sort().at(-1);
   const sameDates = data.rooms.every((r) => r.checkIn === stayIn && r.checkOut === stayOut);
@@ -1707,7 +1662,6 @@ function buildGhlPayload(data) {
 
 // ============================================================
 // JSON error handler (bad JSON, oversized bodies, anything unhandled).
-// Without it Express answers with an HTML stack trace.
 // ============================================================
 app.use((err, req, res, next) => {
   if (err.status === 413) return res.status(413).json({ error: "Payload too large." });

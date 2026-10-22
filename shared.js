@@ -16,11 +16,6 @@ export const secLog = (req, event) => {
 // ============================================================
 // ATTACK MONITOR
 // ============================================================
-// Every [SEC] event adds weight to its client IP for 15 minutes.
-// A real guest trips one or two light events at most (a typo at the guest
-// login, a booking page left open until prices changed). An attacker trips
-// them over and over, or trips one only a forged request can (a bad key,
-// a forged token). An IP at ATTACK_SCORE or more raises an alert.
 const EVENT_WEIGHT = {
   "bad internal API key": 10,               // someone guessing the admin key
   "bad calendar access token": 10,
@@ -48,7 +43,7 @@ const HOUR_MS = 60 * 60 * 1000;
 const ATTACK_SCORE = 10;
 const SITE_ATTACK_SCORE = 60;               // many IPs at once (distributed)
 const BOOKINGS_PER_IP_ALERT = 3;            // successful bookings from one IP in 15 min
-// ponytail: fixed guess for a small resort; raise it if busy days cause false alarms.
+
 const BOOKINGS_PER_HOUR_ALERT = parseInt(process.env.BOOKINGS_PER_HOUR_ALERT) || 8;
 const MAX_TRACKED_IPS = 10000;
 
@@ -103,8 +98,7 @@ function recordEvent(ip, event, now = Date.now()) {
   }
 }
 
-// Called for every accepted booking. Returns how the booking looks:
-// "normal" (clean IP), "suspicious" or "attack" (the IP also tripped [SEC] events).
+// Returns "normal", "suspicious" or "attack".
 export function recordBooking(req, now = Date.now()) {
   const ip = clientIp(req);
   const before = ipReport(ip, now);

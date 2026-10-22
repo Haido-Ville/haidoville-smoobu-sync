@@ -1,10 +1,6 @@
 // ============================================================
 // HAIDOVILLE APP SERVER — GHL Media Proxy (Secured)
 // ============================================================
-// This router proxies GHL Media API calls so that the frontend
-// never touches API keys directly. All endpoints are protected
-// by the same session-hint middleware used across the backend.
-// ============================================================
 
 import express from "express";
 import { v4 as uuidv4 } from "uuid";
@@ -81,8 +77,6 @@ async function resolveFolderId() {
 // ============================================================
 // MIDDLEWARE FACTORY — Attaches session hint middleware
 // ============================================================
-// The actual middleware is injected from server.js so we share
-// the same session store and validation logic.
 let _requireSessionHint = null;
 
 export function setSessionHintMiddleware(mw) {
@@ -96,8 +90,6 @@ function requireSession(req, res, next) {
   _requireSessionHint(req, res, next);
 }
 
-// Only guests verified by /guest-access may upload or see photos.
-// 403 (not 401) so the app knows to relock instead of refreshing the session.
 function requireGuestPass(req, res, next) {
   if (!verifyGuestPass(req.headers["x-guest-pass"])) {
     secLog(req, "missing or invalid guest pass");
@@ -160,10 +152,6 @@ router.get(
 
 // ============================================================
 // POST /app/upload — Upload a photo to GHL Media
-// ============================================================
-// The frontend sends the compressed image as a raw binary body
-// (application/octet-stream). We rebuild the FormData on the
-// server so we can securely inject the parentId.
 // ============================================================
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024; // the app compresses to ~1920px, well under this
 const IMAGE_TYPES = [
@@ -260,15 +248,10 @@ const normName = (s) => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "")
 // ============================================================
 // POST /app/guest-access — Verify guest via Smoobu bookings
 // ============================================================
-// Grants access when the email matches exactly, or (for OTA guests
-// whose Smoobu email is a relay address) the FULL name matches exactly.
-// Only current/upcoming stays count. The response is yes/no plus a signed
-// guest pass: no booking id, name or guest-app link is ever returned.
 router.post(
   "/guest-access",
   limiter(15 * 60 * 1000, 20, { access: false }),
   async (req, res) => {
-    // 1. Origin restriction (if ALLOWED_ORIGIN is set)
     const allowedOriginsEnv = process.env.ALLOWED_ORIGIN;
     const origin = (req.headers.origin || "").replace(/\/$/, "");
     if (allowedOriginsEnv && origin) {
@@ -280,7 +263,6 @@ router.post(
       }
     }
 
-    // 2. Validate Smoobu credentials
     if (!process.env.SMOOBU_API_LABEL || !process.env.SMOOBU_API_SECRET) {
       console.error("[App/Smoobu] SMOOBU_API_LABEL or SMOOBU_API_SECRET not configured.");
       return res.status(500).json({ access: false });

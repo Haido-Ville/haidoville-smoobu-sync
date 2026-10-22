@@ -1,15 +1,7 @@
 // ============================================================
 // Promo banner feed (spec: reports/haido-feature.md)
 // ============================================================
-// The site never calls the feed. Every visitor gets this server's cached
-// copy, and the feed is called at most once per 3 hours, because each call
-// uses up the owner's automation quota.
-//
-// HAIDO_PROMO_FEED holds one of:
-//   - the promo JSON itself, e.g. {"promos":[{...}]}  (no calls at all; for testing the design)
-//   - the n8n webhook URL (https only)                 (cached, max 1 call per 3 hours)
-//   - nothing                                          (no banner, no calls)
-// HAIDO_PROMO_FEED_KEY: sent as the X-Promo-Key header, for n8n Header Auth.
+// Env: HAIDO_PROMO_FEED = promo JSON or https webhook URL; HAIDO_PROMO_FEED_KEY = X-Promo-Key header.
 
 const TTL_MS = 3 * 60 * 60 * 1000;
 const TIMEOUT_MS = 10_000;
@@ -80,7 +72,6 @@ export async function getPromos(now = Date.now()) {
     promos = inline;
   } else if (source.startsWith("https://")) {
     // The clock starts before the call, so a failing feed is also retried only every 3 hours.
-    // ponytail: in-memory cache, so a Render restart costs one extra call; persist it if quota gets tight
     if (now - fetchedAt >= TTL_MS) {
       fetchedAt = now;
       inFlight = fetchFeed(source)
