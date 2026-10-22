@@ -31,8 +31,6 @@ export function verifyHint(hint, ts, sig) {
 }
 
 // ─── Guest pass ────────────────────────────────────────────────────────────────
-// Proof that /app/guest-access matched a booking: "<expiry ms>.<hmac>".
-// Signed with the same env secret as hints, so it survives restarts.
 function guestPassSig(exp) {
   const secret = process.env.SESSION_HINT_SECRET;
   if (!secret) throw new Error("[Encryption] SESSION_HINT_SECRET env var not set.");
@@ -51,10 +49,6 @@ export function verifyGuestPass(pass) {
 }
 
 // ─── Sealed links (staff confirm page, booking receipt) ────────────────────────
-// There is no database: each link carries its own booking data. AES-256-GCM
-// encrypts it (guest details aren't readable in the URL) and authenticates it
-// (a changed character fails to open). The key comes from RECEIPT_SECRET, a
-// fixed env secret, so links keep working across restarts.
 const MAX_LINK_LENGTH = 4096;
 
 function linkKey() {
