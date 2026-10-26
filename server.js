@@ -911,7 +911,11 @@ app.post(
       }
       const paymentType = isCash ? "cash" : finalAmountPaid === calculatedGrandTotal ? "full" : "dp";
 
-      const source = BOOKING_SOURCES.includes(rawData.source) ? rawData.source : BOOKING_SOURCES[0];
+      // ?ref= tag from a booking link (e.g. the chatbot's ?ref=tombot). It goes into the source, which the admin email
+      // and the GHL "Booking Source" field already show.
+      const ref = typeof rawData.ref === "string" && /^[a-z0-9_-]{1,32}$/i.test(rawData.ref) ? rawData.ref.toLowerCase() : "";
+      const source = ref ? `Website (ref: ${ref})`
+        : BOOKING_SOURCES.includes(rawData.source) ? rawData.source : BOOKING_SOURCES[0];
 
       const outcome = await withBookingLock(async () => {
         if (!isCash && isRefAlreadyUsed(clientRef)) {
