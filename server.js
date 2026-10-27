@@ -917,6 +917,13 @@ app.post(
       const source = ref ? `Website (ref: ${ref})`
         : BOOKING_SOURCES.includes(rawData.source) ? rawData.source : BOOKING_SOURCES[0];
 
+      // Link tags for the Smoobu note: ref, Tombot's cid (GHL contact ID), ad utm_* and fbclid. Only safe characters are
+      // kept (no "|" or ",", which split the note). Missing or empty tags are left out.
+      const link = [["ref", ref], ...["cid", "utm_source", "utm_campaign", "fbclid"].map((k) => {
+        const v = rawData.link?.[k];
+        return [k, typeof v === "string" ? v.replace(/[^\w .-]/g, "").trim().slice(0, k === "fbclid" ? 255 : 64) : ""];
+      })].filter(([, v]) => v).map(([k, v]) => `${k}=${v}`).join(", ");
+
       const outcome = await withBookingLock(async () => {
         if (!isCash && isRefAlreadyUsed(clientRef)) {
           return { status: 409, body: { error: "This reference number was already used for another booking." } };
@@ -929,6 +936,7 @@ app.post(
         const data = {
           bookingId: generateUniqueBookingId(),
           source,
+          link,
           submittedAt: new Date().toISOString(),
           guest: sanitizedGuest,
           rooms: finalProcessedRooms,
@@ -1439,7 +1447,8 @@ async function createSmoobuDraft(data) {
         price: pricePerUnit,
         priceStatus: 0,
         // "Ref: <ref>" is parsed back by seedRefsFromSmoobu() — keep the format.
-        notice: `[WEBSITE ${data.bookingId}] ${data.payment.channel === "cash" ? "₱0 PAID" : `GUEST SAYS PAID ₱${data.payment.amount} (UNVERIFIED)`} OF ₱${data.payment.grandTotal} |${data.payment.channel.toUpperCase()} | Ref: ${data.payment.referenceNumber} | ${data.payment.channel === "cash" ? "WALK-IN — CASH ON ARRIVAL" : "AWAITING RECEIPT VERIFICATION"}${bedSuffix ? " | " + bedSuffix.trim() : ""}${approvalNote(data.rooms) ? " | " + approvalNote(data.rooms).toUpperCase() : ""} | CHECK ID 18+`,
+        // No amounts or payment status here: the note never updates, so GHL holds the verified payment.
+        notice: `[WEBSITE ${data.bookingId}] ${data.payment.channel.toUpperCase()} | Ref: ${data.payment.referenceNumber}${data.payment.channel === "cash" ? " | WALK-IN — CASH ON ARRIVAL" : ""}${bedSuffix ? " | " + bedSuffix.trim() : ""}${approvalNote(data.rooms) ? " | " + approvalNote(data.rooms).toUpperCase() : ""} | CHECK ID 18+${data.link ? " | LINK: " + data.link : ""}`,
         language: "en",
       };
 
