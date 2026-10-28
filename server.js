@@ -252,9 +252,9 @@ function calculateRoomPrice(roomName, pax, nights, checkIn, checkOut) {
       if (pax === 3) return 1500 * nights;
       throw new Error("Couple Room max pax is 3.");
     case "Barkada Room":
-      if (pax >= 6 && pax <= 7) return 3500 * nights;
-      if (pax >= 8 && pax <= 9) return 500 * pax * nights;
-      throw new Error("Barkada Room pax must be 6–9.");
+      if (pax <= 7) return 3500 * nights; // flat for 1–7 guests, no minimum (owner)
+      if (pax <= 9) return 500 * pax * nights;
+      throw new Error("Barkada Room max pax is 9.");
     case "Family Room 1":
     case "Family Room 2":
       // 5 standard; 6–7 only with HaidoVille's approval, at ₱500/head.
