@@ -215,28 +215,9 @@ function isValidDate(str) {
   return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === str;
 }
 
-// ---- Booker age (18+) ----
-const UNDER_AGE_MSG = "The person making this booking must be 18 or older. Please ask an adult or guardian to book.";
-const BAD_DOB_MSG = "Please enter a valid date of birth.";
-const manilaToday = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Manila" }); // YYYY-MM-DD
-
-// Whole years old today, or null for a missing, invalid or future date.
-function bookerAge(birthDate) {
-  if (typeof birthDate !== "string" || !isValidDate(birthDate)) return null;
-  const today = manilaToday();
-  if (birthDate > today) return null;
-  // Feb 29 birthdays turn a year older on Mar 1 in non-leap years.
-  return Number(today.slice(0, 4)) - Number(birthDate.slice(0, 4)) - (today.slice(5) < birthDate.slice(5) ? 1 : 0);
-}
-
-// Error message when this booker can't book, or null.
-function bookerError(birthDate, ageConfirmed) {
-  const age = bookerAge(birthDate);
-  if (age === null || age > 120) return BAD_DOB_MSG;
-  if (age < 18) return UNDER_AGE_MSG;
-  if (ageConfirmed !== true) return "Please confirm you understand the ID requirement.";
-  return null;
-}
+// ---- Booker 18+ ----
+// No birth date (owner, 2026-10-28): the booker ticks "I Understand" (18+ and valid ID); staff check the ID at check-in.
+const bookerError = (ageConfirmed) => (ageConfirmed === true ? null : "Please confirm you understand the ID requirement.");
 
 // ---- Booking ID generator ----
 function generateUniqueBookingId() {
@@ -426,8 +407,8 @@ const requireJwtToken = (req, res, next) => {
 
 // ---- Booker pass ----
 const BOOKER_PASS_TTL = "30m";
-const signBookerPass = (birthDate) =>
-  jwt.sign({ typ: "booker", bd: birthDate }, JWT_CURR_SEC, { expiresIn: BOOKER_PASS_TTL, algorithm: "HS256" });
+const signBookerPass = () =>
+  jwt.sign({ typ: "booker" }, JWT_CURR_SEC, { expiresIn: BOOKER_PASS_TTL, algorithm: "HS256" });
 
 const requireBookerPass = (req, res, next) => {
   const token = String(req.headers["x-booker-pass"] || "");
@@ -435,12 +416,11 @@ const requireBookerPass = (req, res, next) => {
   for (const key of [JWT_CURR_SEC, JWT_PREV_SEC]) {
     try { decoded = jwt.verify(token, key, { algorithms: ["HS256"] }); break; } catch { /* try previous key */ }
   }
-  if (decoded?.typ !== "booker" || bookerError(decoded.bd, true)) {
-    // Also an expired pass (30 min) or a server restart; the page re-checks the age and retries.
+  if (decoded?.typ !== "booker") {
+    // Also an expired pass (30 min) or a server restart; the page re-checks and retries.
     secLog(req, "missing or invalid booker pass");
     return res.status(403).json({ error: "Please confirm your details again.", code: "BOOKER_PASS" });
   }
-  req.bookerBirthDate = decoded.bd;
   req.bookerConfirmedAt = decoded.iat * 1000; // when the booker ticked "I Understand" (last re-check)
   next();
 };
@@ -651,14 +631,13 @@ app.get("/api/session-hint", tokenRateLimiter, (req, res) => {
 });
 
 // ============================================================
-// POST /booking/verify-booker — Step 2 -> 3 age check (18+)
+// POST /booking/verify-booker — Step 2 -> 3 "I Understand" check (18+)
 // ============================================================
 // Doesn't use up the session: the page re-checks quietly when a pass expires.
 app.post("/booking/verify-booker", tokenRateLimiter, requireValidSessionHint, (req, res) => {
-  const { birthDate, ageConfirmed } = req.body || {};
-  const error = bookerError(birthDate, ageConfirmed);
+  const error = bookerError((req.body || {}).ageConfirmed);
   if (error) return res.status(400).json({ error });
-  res.json({ pass: signBookerPass(birthDate) });
+  res.json({ pass: signBookerPass() });
 });
 
 // ============================================================
@@ -809,7 +788,6 @@ app.post(
         name: sanitizeText(rawData.guest.name, 80),
         email: sanitizeText(rawData.guest.email, 80),
         phone: sanitizeText(rawData.guest.phone, 30),
-        age: sanitizeText(rawData.guest.age, 10),
         nationality: sanitizeText(rawData.guest.nationality, 30),
         address: sanitizeText(rawData.guest.address, 200),
         arrivalTime: sanitizeText(rawData.guest.arrivalTime, 20),
@@ -824,14 +802,12 @@ app.post(
       if (!sanitizedGuest.phone) return res.status(400).json({ error: PHONE_MSG });
 
       // The page only gets here after verify-booker, so a failure means a tampered request.
-      const ageError = bookerError(rawData.guest.birthDate, rawData.guest.ageConfirmed);
-      if (ageError || rawData.guest.birthDate !== req.bookerBirthDate) {
+      const ageError = bookerError(rawData.guest.ageConfirmed);
+      if (ageError) {
         secLog(req, "booker age details tampered");
-        return res.status(400).json({ error: ageError || "Please confirm your details again." });
+        return res.status(400).json({ error: ageError });
       }
-      sanitizedGuest.birthDate = req.bookerBirthDate;
       sanitizedGuest.ageConfirmedAt = new Date(req.bookerConfirmedAt).toISOString();
-      sanitizedGuest.age = String(bookerAge(req.bookerBirthDate)); // GHL "age" field
 
       const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
       const emailKey = sanitizedGuest.email.toLowerCase();
@@ -1018,7 +994,7 @@ function bookingSnapshot(data) {
   return {
     id: data.bookingId,
     at: data.submittedAt,
-    guest: { name: g.name, email: g.email, phone: g.phone, birthDate: g.birthDate, age: g.age, ageConfirmedAt: g.ageConfirmedAt },
+    guest: { name: g.name, email: g.email, phone: g.phone, ageConfirmedAt: g.ageConfirmedAt },
     rooms: data.rooms.map((r) => ({ name: r.name, checkIn: r.checkIn, checkOut: r.checkOut, nights: r.nights, pax: r.pax, paxLabel: r.paxLabel, subtotal: r.subtotal })),
     payment: {
       channel: data.payment.channel, type: data.payment.type, amount: data.payment.amount,
@@ -1253,7 +1229,7 @@ function receiptRoute(kind, forGuest) {
     const rows = bookingRows(b);
     const guestRows = forGuest
       ? `<tr><td>Name</td><td>${esc(b.guest.name)}</td></tr>`
-      : `${rows.guest}<tr><td>Birth date</td><td>${esc(b.guest.birthDate)} (age ${esc(b.guest.age)})</td></tr>`;
+      : rows.guest;
     const after = forGuest
       ? `<div class="notice"><strong>Before you arrive</strong><ul>
           ${balance > 0 ? `<li>Please settle the balance of ${esc(peso(balance))} at check-in.</li>` : ""}
@@ -1261,7 +1237,7 @@ function receiptRoute(kind, forGuest) {
         </ul></div>`
       : `<h2>Check-in checklist</h2>
         <ul class="check">
-          <li>Valid ID matches the name and birth date (18+)</li>
+          <li>Valid ID matches the name (booker 18+)</li>
           ${balance > 0 ? `<li>Balance of ${esc(peso(balance))} collected</li>` : ""}
         </ul>`;
     sendPage(res, 200, `Receipt ${b.id}`, `<div class="band"><small>BOOKING RECEIPT</small><strong>${esc(b.id)}</strong></div>
@@ -1272,7 +1248,7 @@ function receiptRoute(kind, forGuest) {
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2"/><circle cx="8.5" cy="11" r="2.2"/><path d="M5.5 16c.6-1.6 1.7-2.4 3-2.4s2.4.8 3 2.4M14 10h4.5M14 13.5h3"/></svg>
     <div>${forGuest
       ? `<b>Bring a valid ID</b><span>The person who made this booking must be <strong>18 or older</strong> and present a <strong>valid ID</strong> matching the name on this receipt at check-in.</span>`
-      : `<b>Check the booker's valid ID</b><span>The name and birth date on the ID must match this receipt (born ${esc(b.guest.birthDate)}, age ${esc(b.guest.age)}). The booker must be <strong>18 or older</strong>. If it does not match, do not cancel; flag it for review.</span>`}</div>
+      : `<b>Check the booker's valid ID</b><span>The name on the ID must match this receipt. The booker must be <strong>18 or older</strong>. If it does not match, do not cancel; flag it for review.</span>`}</div>
   </div>
   <h2>Guest</h2><table>${guestRows}</table>
   ${forGuest ? "" : `<p style="font-size:12px;margin-top:8px">Confirmed 18+ and the ID requirement on ${esc(b.guest.ageConfirmedAt ? fmtManilaTime(b.guest.ageConfirmedAt) : "—")}</p>`}
@@ -1520,7 +1496,6 @@ async function sendBookingEmail(data) {
         <p style="margin:4px 0;"><strong>Name:</strong> ${esc(data.guest.name)}</p>
         <p style="margin:4px 0;"><strong>Email:</strong> ${esc(data.guest.email)}</p>
         <p style="margin:4px 0;"><strong>Phone:</strong> ${esc(data.guest.phone)}</p>
-        <p style="margin:4px 0;"><strong>Date of Birth:</strong> ${esc(data.guest.birthDate)} (age ${esc(data.guest.age)})</p>
         ${data.guest.nationality ? `<p style="margin:4px 0;"><strong>Nationality:</strong> ${esc(data.guest.nationality)}</p>` : ""}
         ${data.guest.address ? `<p style="margin:4px 0;"><strong>Address:</strong> ${esc(data.guest.address)}</p>` : ""}
         ${data.guest.arrivalTime ? `<p style="margin:4px 0;"><strong>Arrival Time:</strong> ${esc(data.guest.arrivalTime)}</p>` : ""}
@@ -1539,7 +1514,7 @@ async function sendBookingEmail(data) {
           ${actionNeededHtml}
         </div>
         <div style="background:#fff;border-left:4px solid #C9A96E;padding:12px;margin-top:12px;border-radius:4px;">
-          <strong>🪪 Check the booker's valid ID (18+) at check-in.</strong><br>The name and date of birth must match this booking. If they do not match, do not cancel; flag it for review.
+          <strong>🪪 Check the booker's valid ID (18+) at check-in.</strong><br>The name must match this booking. If they do not match, do not cancel; flag it for review.
         </div>
       </div>
     </div>
@@ -1632,7 +1607,7 @@ function buildGhlPayload(data) {
     guest_name: data.guest.name || "",
     contact_number: data.guest.phone || "",
     email_address: data.guest.email || "",
-    age: String(data.guest.age || ""),
+    age: "18+", // every booking passed the "I Understand" tick; kept so the GHL mapping stays as it is
     nationality: data.guest.nationality || "",
     complete_address: data.guest.address || "",
     room_type: roomType,
@@ -1660,7 +1635,7 @@ function buildGhlPayload(data) {
     // Staff buttons in the payment-check email: {{contact.staff_link}}?action=dp&contact_id={{contact.id}}
     staff_link: staffLink(data),
     payment_status: paymentStatus(data.payment),
-    birth_date: data.guest.birthDate || "",
+    birth_date: "", // no longer asked (owner, 2026-10-28)
     age_confirmed_at: data.guest.ageConfirmedAt ? fmtManilaTime(data.guest.ageConfirmedAt) : "",
     all_rooms: data.rooms.map((r) => ({
       name: r.name,
