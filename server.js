@@ -894,11 +894,12 @@ app.post(
         : BOOKING_SOURCES.includes(rawData.source) ? rawData.source : BOOKING_SOURCES[0];
 
       // Link tags for the Smoobu note: ref, Tombot's cid (GHL contact ID), ad utm_* and fbclid. Only safe characters are
-      // kept (no "|" or ",", which split the note). Missing or empty tags are left out.
-      const link = [["ref", ref], ...["cid", "utm_source", "utm_campaign", "fbclid"].map((k) => {
+      // kept (no "|" or ",", which split the note). Missing or empty tags are left out, except ref: a booking with no
+      // link tag shows ref=direct, so every note says where the booking came from.
+      const link = [["ref", ref || "direct"], ...["cid", "utm_source", "utm_campaign", "fbclid"].map((k) => {
         const v = rawData.link?.[k];
         return [k, typeof v === "string" ? v.replace(/[^\w .-]/g, "").trim().slice(0, k === "fbclid" ? 255 : 64) : ""];
-      })].filter(([, v]) => v).map(([k, v]) => `${k}=${v}`).join(", ");
+      })].filter(([, v]) => v).map(([k, v]) => `${k}=${v}`).join(" | ");
 
       const outcome = await withBookingLock(async () => {
         if (!isCash && isRefAlreadyUsed(clientRef)) {
