@@ -1625,8 +1625,9 @@ function buildGhlPayload(data) {
     payment_ref: data.payment.referenceNumber || "",
     total_amount: String(grandTotal),
     dp_amount: String(dpAmount),
-    balance: String(grandTotal), // nothing is verified yet
-    // Number fields for the GHL Math steps in Mark DP / Payment Received.
+    balance: String(grandTotal - dpAmount), // shown as BALANCE DUE in the alert: total minus the DP the guest says they sent
+    // Number fields for the GHL Math steps in Mark DP / Payment Received. Stays the full total: those steps subtract
+    // only what Thor verifies.
     balance_number: grandTotal,
     verified_paid_total: 0,
     payment_type: PAY_TYPE_NAMES[data.payment.type],
