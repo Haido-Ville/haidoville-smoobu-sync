@@ -434,6 +434,7 @@ const pingRateLimiter = limiter(60 * 1000, 12);
 const availabilityRateLimiter = limiter(60 * 1000, 30);
 const inquiryRateLimiter = limiter(15 * 60 * 1000, 5);
 const promoRateLimiter = limiter(60 * 1000, 30);
+const shortlinkRateLimiter = limiter(60 * 1000, 30); // also slows code guessing
 
 // ============================================================
 // GET /ping — Public keep-alive endpoint (no auth)
@@ -661,6 +662,29 @@ app.get("/api/payment-methods", tokenRateLimiter, requireSessionHint, requireBoo
 app.get("/api/haido-promo", promoRateLimiter, async (req, res) => {
   res.set("Cache-Control", "public, max-age=300");
   res.json({ promos: await getPromos().catch(() => []) });
+});
+
+// ============================================================
+// GET /b/:code — Short booking links (go.haidoville.com/b/TEST01)
+// ============================================================
+// n8n stores the full booking URL per code. We 302 to it, but only to https://haidoville.com/
+// (no open redirect). Bad code, n8n error, timeout or not found: go to the homepage.
+const SHORTLINK_LOOKUP = "https://jenab0gsz.app.n8n.cloud/webhook/haido-shortlink?code=";
+const SITE_HOME = "https://haidoville.com/";
+app.get("/b/:code", shortlinkRateLimiter, async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  const { code } = req.params;
+  let url = SITE_HOME;
+  if (/^[A-Za-z0-9]{1,12}$/.test(code)) {
+    try {
+      const data = await (await fetch(SHORTLINK_LOOKUP + code, { signal: AbortSignal.timeout(5000) })).json();
+      const target = new URL(data.url);
+      if (data.found === true && target.protocol === "https:" && target.hostname === "haidoville.com" && data.url.startsWith(SITE_HOME)) {
+        url = data.url;
+      }
+    } catch {}
+  }
+  res.redirect(302, url);
 });
 
 // ============================================================
