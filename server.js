@@ -671,18 +671,30 @@ app.get("/api/haido-promo", promoRateLimiter, async (req, res) => {
 // (no open redirect). Bad code, n8n error, timeout or not found: go to the homepage.
 const SHORTLINK_LOOKUP = "https://jenab0gsz.app.n8n.cloud/webhook/haido-shortlink?code=";
 const SITE_HOME = "https://haidoville.com/";
+// Code -> URL never changes, so found:true is cached 24 h. found:false and errors are not kept.
+// 24 h, not 14 days: the cache starts at first open, so an expired n8n code redirects at most 1 day too long.
+// The cache holds the pending lookup itself, so a burst of link previews shares one n8n call.
+// ponytail: in-memory, lost on Render restart/redeploy (then 1 call per code again); use a store if that matters.
+const SHORTLINK_TTL_MS = 24 * 60 * 60 * 1000;
+const shortlinkCache = new Map(); // code -> { at, url: Promise<string|null> }
+async function lookupShortlink(code) {
+  const data = await (await fetch(SHORTLINK_LOOKUP + code, { signal: AbortSignal.timeout(5000) })).json();
+  const target = new URL(data.url);
+  const ok = data.found === true && target.protocol === "https:" && target.hostname === "haidoville.com" && data.url.startsWith(SITE_HOME);
+  return ok ? data.url : null;
+}
 app.get("/b/:code", shortlinkRateLimiter, async (req, res) => {
   res.set("Cache-Control", "no-store");
   const { code } = req.params;
   let url = SITE_HOME;
   if (/^[A-Za-z0-9]{1,12}$/.test(code)) {
-    try {
-      const data = await (await fetch(SHORTLINK_LOOKUP + code, { signal: AbortSignal.timeout(5000) })).json();
-      const target = new URL(data.url);
-      if (data.found === true && target.protocol === "https:" && target.hostname === "haidoville.com" && data.url.startsWith(SITE_HOME)) {
-        url = data.url;
-      }
-    } catch {}
+    let hit = shortlinkCache.get(code);
+    if (!hit || Date.now() - hit.at > SHORTLINK_TTL_MS) {
+      hit = { at: Date.now(), url: lookupShortlink(code).catch(() => null) };
+      shortlinkCache.set(code, hit);
+      hit.url.then((u) => { if (!u && shortlinkCache.get(code) === hit) shortlinkCache.delete(code); });
+    }
+    url = (await hit.url) || SITE_HOME;
   }
   res.redirect(302, url);
 });
